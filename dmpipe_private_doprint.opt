@@ -1,0 +1,26 @@
+!
+! Options file for linking programs that use dmpipe functions.  Special care
+! must be taken to avoid multiple definitions.
+!
+dmpipe-private_doprint.obj
+dmpipe_bypass.obj
+memstream.obj
+dmpipe_poll.obj
+doscan.obj
+doscan_flt_gx.obj
+doscan_flt_dx.obj
+doscan_flt_tx.obj
+doscan_flt_g.obj
+doscan_flt_d.obj
+doscan_flt_t.obj
+!
+! Use private implementation of doprint so we can link against decc$shr.
+! floating point formatting compiles with separate options.
+!
+doprint.obj
+doprint_flt_gx.obj
+doprint_flt_g.obj
+doprint_flt_tx.obj
+doprint_flt_t.obj
+doprint_flt_dx.obj
+doprint_flt_d.obj

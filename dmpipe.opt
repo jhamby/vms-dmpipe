@@ -1,0 +1,21 @@
+!
+! Options file for linking programs that use dmpipe functions.  Special care
+! must be taken to avoid multiple definitions.
+!
+dmpipe.obj
+dmpipe_bypass.obj
+memstream.obj
+dmpipe_poll.obj
+doscan.obj
+doscan_flt_gx.obj
+doscan_flt_dx.obj
+doscan_flt_tx.obj
+doscan_flt_g.obj
+doscan_flt_d.obj
+doscan_flt_t.obj
+!
+! Mystical step required to keep multiply declared symbol errors from
+! being generated.  Note that full CRTL is pulled in from the starlet.olb
+! object library so images are large.
+!
+sys$share:starlet.olb/library/include=(CMA$TIS)

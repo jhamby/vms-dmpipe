@@ -1,0 +1,201 @@
+								 7-APR-2014
+
+DMPIPE is a libary of functions to optimize pipe-based communication between
+C-based programs.  When the programs on both sides (writer and reader) of
+a pipe are built using DMPIPE, the data transfer takes place via shared memory
+(VMS group global section) rather than through a mailbox or DCL pipe. If a
+DMPIPE-based program is only on one end of the pipe, it transparently falls
+back to using the CRTL pipe impelentation.
+
+This implementation uses macros defined in the dmpipe.h header file to override 
+standard C I/O functions with wrapper routines.  Note that all source files
+in the application which do I/O must include the header file.  This
+implementation is not complete, but intended to show the concept of an
+adaptive approach to high-performance pipes.
+
+List of wrapped CRTL functions:
+    close(), fclose(), fcntl(), fdopen(), fgetc(), fgets(), fprintf(), fopen(),
+    fread(), fscanf(), fwrite(), open(), perror(), pipe(), poll(), popen(), 
+    printf(), read(), scanf(), select(), ungetc(), write()
+
+
+Source modules:
+    dmpipe.c		Contains the functions that supplant C RTL I/O
+                        functions (e.g. dm_fread() to replace fread()).
+			These functions return actual FILE pointers and
+			file descriptors.
+
+    dmpipe_bypass.c	Functions to handle setup of pipe I/O bypass operations,
+			called by dmpipe.  Shared memory creation and DLM calls
+			take place in this module.
+
+    memstream.c		Memory-based interprocess communication functions with
+                        pipe-like semantics.  While a shared memory global
+                        section is used to transfer data, synchronization
+			and signalling done via hiber/wake and the distributed
+			lock manager.
+
+    dmpipe_poll.c       Functions to support the dm_poll() and dm_select()
+			wrapper functions in dmpipe.c.  Additionally, a
+			dm_fnctl() wrapper function was added to support
+			setting memstream pipes nonblocking.
+
+    doscan.c		Functions to support dm_scanf() and dm_fscanf(). The
+    doscan_flt_all.c	format specification string proesseed against pipe
+			input stream.
+
+    doprint.c        	Functions to support dm_printf() and dm_fprintf(). To
+    doprint_flt_all.c	use these functions rather than decc$$doprint(), build
+			the library with /macro=private_doprint=1.  Using the
+			private doprint() option allows linking against
+			decc$shr.exe, greatly reducing the image size.
+
+Header files:
+    dmpipe.h            Must be included by all source files in the
+			application.
+    dmpipe_bypass.h     Internal use.
+    dmpipe_poll.h	Internal use.
+    doprint.h		Internal use.
+    doscan.h		Internal use.
+    memstream.h		Internal use.
+
+Demonstration program:
+
+    case_munge.exe	Filter program to read a text file, change character
+                        case in various ways according to a command line 
+			argument, and output the result to stdout or a command
+			spawned with popen().  The program measures run perf-
+			ormance with LIB$xxx_TIMER routines and outputs the 
+			result to the terminal (TT:):.
+
+    hmac.exe            Program to compute security hashes and output byte
+			count and hash value.  Input is stdin by default
+			but may be a file or a command opened with popen()
+			specified on command line.
+
+    test_poll.exe	Program to test dm_poll().  The output from multiple
+			child processes is read concurrently.
+
+Build files:
+
+    descrip.mms		MMS description file to compile and link demonstration
+			programs.  Two forms of each program are made:
+                            hmac.exe,case_munge.exe        DMPIPE enabled.
+			    hmace-0.exe,case_munge-o.exe   Not DMPIPE enhanced.
+
+    dmpipe.opt		Must be used to link DMPIPE-enabled programs.  In
+			order to access the doprint engine for printf 
+			processing (e.g. decc$$gxdopring()), programs are
+			linked against startlet.olb object library rather 
+			than decc$shr.exe.
+
+    dmpipe_private_doprint.opt
+			Use this option file instead of dmpipe.opt to link
+			DMPIPE-enabled programs against decc$shr.exe.  Since
+			decc$shr does not expose the C$DOPRINT engine, a
+			private, less complete, implementation is used.
+
+    hmac.opt		Options file for linking hmac.obj with the OpenSSL
+			crypto library.
+
+    hmac-0.opt		Options file for linking hmac-0.obj with the OpenSSL
+			crypto library.
+
+------------------------------------------------------------------------------
+
+Implementation notes.
+
+Developement and testing environment:
+   Alpha DS10L-466 and Stromasys PersonalAlpha DS20 emulator.
+   OpenVMS 8.4
+   HP C V7.3-009 (DS10) and Compac C V6.5-001 (DS20)
+   MMS V3.8-2 (DS10) and MMS V3.5 (DS20)
+
+DMPIPE keeps an extension structure (struct dm_fd_extension{}) for each 
+open file, keyed by the file descriptor number (i.e. 0 is stdin, 1 is 
+stdout, etc.).  Each call to a wrapper function looks up the extension block 
+for the fd or FILE pointer and checks a flag for whether a bypass is active 
+or the call should be passed through to the underlying CRTL function.  
+Non-pipe devices always have the bypass flag clear and transfer to the CRTL 
+with minimum overhead.  A small cache of recent FILE pointers is kept to
+quickly translate them to their corresponding fd.
+
+On first reference to a fd by a wrapper function, dm_bypass_init() is called
+to determine if the open file is cabable of being bypassed (i.e. is a pipe)
+and if so will return a dm_bypass structure that is saved as part of the
+extension structure. The bypass structure at that point contains device 
+information and the lksb for the lock named DMPIPE_ddcnnn. The lock value 
+block is used to determine if the program at the other end of the pipe is 
+DMPIPE enabled and coordinate switching to the pipe bypass.
+
+The wrapper functions for open() calls will create bypass structures, but
+the negotiation for creating the bypass stream is deferred until the first read
+or write.  We must stall in order to discover whether the other process is
+capable of using the bypass.  For mailbox-based pipes, we set up a blocking AST
+on the device lock and the appropriate attention AST on the mailbox and wait
+for the first one to fire.  The pipe device used by DCL doesnt have attention
+ASTs so we are left with a dilemma on how to do the stall.  For now, I just
+wait 200 milliseconds for the lock conflict to show up and assume the other end
+is a non-DMPIPE program if it times out.
+
+To negotiate setup of bypass streams, the lock value block is split into 2 
+quadwords. Each end of the pipe will claim one of the quadwords by writing 
+its PID into the pid field.  Either process can request a uni-directional 
+stream going either direction.  If a second stream is needed for bi-directional
+I/O the process that didn't assign the first stream must request it.  
+Processes exchange the lock value block by cycling between PW mode and CR mode
+locks.
+
+    struct value_block {
+	struct {
+	    long pid;			/* may be either process */
+	    unsigned short flags;
+	    unsigned short stream_id;
+	} valunit[2];
+    }
+
+    flag bits:
+        <0>     (shutdown) Process as closed the stream or process decided to
+		discontinue negotiation.
+
+	<1>	(connect_stream) PID has created a new memstream buffer in
+		shared memory and wishes for peer to connect to it.  Global
+		section name is DMPIPE_mbxname.stream_id.  Stream_id in
+		valunit is set to one higher than highest stream_id in eiher
+		valunit block.
+
+	<2>     (will_write) PID indicates if set that it will be writing to 
+		stream indicated by stream_id.  If clear, PID will read.
+
+	<3>	(wake_request) PID indicates that it is hibernating with
+		the lock held at CR mode and will continue to do so until
+		the peer clears this bit and wakes the process.
+
+	<4>	(peer_ack) Peer process sets this bit to acknowlege it
+		as connected to stream given by stream_id.
+
+	<5>	(peer_nak) Peer is unable or unwilling to use the 
+		bypass stream.
+
+
+Some work has been done on a private implementation of C$DOPRINT(), allowing
+linking with DECC$SHR instead of starlet.olb (with much smaller images).  It
+needs much further development (floating point formats are a headache).
+
+The dm_poll() implementation was roughly modelled on vms_poll_select_hack.c,
+but utilizes the fd extension infra-structure to alleviate some of the
+overhead.  Classification of the device type (pipe,tty,socket) is only
+done once and retained as part of the fd_extension until the fd is closed.
+A dm_poll() is broken down into 4 steps:
+
+    1.  Create a poll group.
+    2   Loop through filedes array and each array element:
+           a. create a poll track extension if first time referencing the fd.
+           b. Add the fd in the filedes array to the poll group.
+    3.  Scan the poll group, with optional timeout.
+    4.  Delete the poll group.
+
+The poll track object is loaded with pointer to device-specific functions
+for polling its particular device type.
+
+fcntl flags where added to memstream to support non-blocking I/O.

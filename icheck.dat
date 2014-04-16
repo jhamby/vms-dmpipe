@@ -1,0 +1,18 @@
+the token following icheck 0 is interpreted as uing %i
+aruntogetherwordthatGoesover20chars and
+icheck 800
+icheck 300
+icheck -4810
+icheck -100
+icheck 0100
+icheck -0100
+icheck 0x100
+icheck -0x100
+fcheck 0           
+fcheck -314      
+fcheck 3.14  
+fcheck -3.14e10  
+dcheck 0           
+dcheck -314      
+dcheck 3.14  
+dcheck -3.14e10  
