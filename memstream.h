@@ -41,7 +41,7 @@ int memstream_assign_statistics ( memstream stream,
 
 int memstream_write ( memstream stream, const void *buffer, int bufsize );
 
-int memstream_read ( memstream stream, void *buffer, int bufsize );
+int memstream_read(memstream stream, void *buffer, int bufsize, int min_bytes);
 
 int memstream_control ( memstream stream, int *new_attributes, 
 	int *old_attribtes );
@@ -57,4 +57,5 @@ int memstream_close ( memstream stream );
 
 int memstream_destroy ( memstream stream );
 
+int memstream_flush ( memstream stream );
 #endif

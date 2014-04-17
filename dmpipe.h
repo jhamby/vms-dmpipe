@@ -4,6 +4,12 @@
  * Define functional replacements for CRTL I/O routines that bypass
  * pipe device and use shared memory instead.  The dual mode pipe retain
  * legacy mailbox operations unless both sides are using these functions.
+ *
+ * Conditional compilation macros:
+ *    DM_NO_CRTL_WRAP		If defined, do not define macros to wrap
+ *				CRTL functions.
+ *    DM_WRAP_MAIN		if defined, insert a main function that
+ *				wraps application main() in same module.
  */
 #include <stdio.h>
 #include <unistd.h>		/* pipe definitions, pipe(), close() */
@@ -11,15 +17,6 @@
 #include <poll.h>		/* poll() and friends */
 #include <socket.h>		/* select() was implemented by TCP/IP dev. */
 #include <time.h>		/* Select() */
-#ifdef lkjlkjwer
-
-void FD_CLR(int fd, fd_set *set);
-int  FD_ISSET(int fd, fd_set *set);
-void FD_SET(int fd, fd_set *set);
-void FD_ZERO(fd_set *set);
-
-#include <sys/select.h>
-#endif
 
 int dm_pipe ( int fds[2] );
 ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes );
@@ -47,6 +44,8 @@ int dm_select(int nfds, fd_set *readfds, fd_set *writefds,
            fd_set *exceptfds, struct timeval *timeout);
 int dm_poll ( struct pollfd filedes[], nfds_t nfds, int timeout );
 void dm_perror ( const char *str );
+int dm_fflush ( FILE *fptr );
+int dm_fsync ( int fd );
 /*
  * Statistics retreival.
  */
@@ -151,6 +150,34 @@ int dm_scanf_t ( const char *fmt, ... );
 #define fcntl dm_fcntl
 #define poll dm_poll
 #define select dm_select
+#define fflush dm_fflush
+#define fsynch dm_fsync
 #endif /* DM_NO_CRTL_WRAP */
+
+#ifdef DM_WRAP_MAIN
+#include <signal.h>
+#include <errnodef.h>
+static void exit_on_EPIPE ( int sig, ... )
+{
+    exit ( C$_SIGPIPE );
+}
+int main ( int argc, char **argv, char **envp )
+{
+    int status, dm_wrapped_main();
+    struct pollfd poll_set[2] = { { -1, POLLIN, 0 }, { -1, POLLOUT, 0 } };
+    /*
+     * When stdin is a pipe, do a poll to force init of bypass so upstream
+     * writers get a broken pipe instead of DCL reading it.
+     */
+    /* if ( isapipe ( 0 ) ) */ poll_set[0].fd = 0;
+    if ( isapipe ( 1 ) ) poll_set[1].fd = 1;
+    if ( (poll_set[0].fd==0) || (poll_set[1].fd==1) ) dm_poll(poll_set, 2, 0);
+
+    ssignal ( SIGPIPE, exit_on_EPIPE );
+    status = dm_wrapped_main ( argc, argv, envp );
+    return status;
+}
+#define main dm_wrapped_main
+#endif /* DM_WRAP_MAIN */
 
 #endif /* DM_PIPE_H */

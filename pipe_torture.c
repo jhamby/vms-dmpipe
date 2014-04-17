@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <unixio.h>
+#define DM_WRAP_MAIN
 #include "dmpipe.h"	/* wrap function */
 
 struct test_data {
@@ -43,7 +44,7 @@ struct test_data tests[NUM_TESTS] = {
     {  10,   5,  0,   5, 0, "w",
       "child writes 10, parent reads 5 and closes; should see 10 writes, 5 reads" },
     {  10,   5,  0,   5, 1, "w",
-      "child writes/flushes 10, parent reads 5 and closes; should see 6 writes, 5 reads" },
+      "child s writes/flushes 10, parent reads 5 and closes; should see 6 writes, 5 reads" },
     {   5,  10,  0,   0, 0, "w",  /* 5 */
       "child writes 5, parent reads 10; should see 5 writes, 5 reads, 5 EOFs" },
     { 100, 100,  0,   0, 0, "w",
@@ -54,7 +55,7 @@ struct test_data tests[NUM_TESTS] = {
       "parent writes 5, child reads 6; should see 5 writes, 5 reads, 1 EOF" },
     {  10,   5,  2,   0, 0, "r",
       "parent writes 5, child reads 10; should see 5 writes, 5 reads, 5 EOFs" },
-    {   0,   5,  0,   0, 0, "r",   /* 11 */
+    {   0,   5,  0,   0, 0, "r",   /* 10 */
      "parent writes 5, child reads none; should see 5 writes only" },
     {   5,  10,  0,   0, 0, "r",
       "parent writes 10, child reads 5 and exits; should see 10 writes, 5 reads" }
@@ -103,7 +104,7 @@ int main(int argc, char *argv[]) {
             }
             while(fgets(readbuf, READBUF_SIZE, pipe_fp))
                 printf("%s", readbuf);
-            fflush(pipe_fp);
+            /* fflush(pipe_fp); */
             pclose(pipe_fp);
         }
 
@@ -121,7 +122,7 @@ int main(int argc, char *argv[]) {
                 tests[testnum-1].mode, 
                 tests[testnum-1].pre_sleep,
                 tests[testnum-1].num_child_ops,
-                tests[testnum-1].pre_sleep,
+                tests[testnum-1].post_sleep,
                 tests[testnum-1].frequent_flusher);
 
         /* Parent reads when child writes and vice versa. */
@@ -168,8 +169,7 @@ int main(int argc, char *argv[]) {
         char frequent_flusher = (char)atoi(argv[7]); char buffer[400];
         int j;
 
-        if (pre_sleep)
-            sleep(pre_sleep);
+	while ( pre_sleep > 0 ) pre_sleep = sleep ( pre_sleep );
 
         for (i = 1; i <= num_ops; i++) {
             if (*mode == 'r') {
@@ -200,7 +200,7 @@ int main(int argc, char *argv[]) {
                 printf("\n");
             }
         }
-        if (post_sleep)
-            sleep(post_sleep);
+	while ( post_sleep > 0 ) post_sleep = sleep ( post_sleep );
     }
+    return 0;
 }

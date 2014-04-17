@@ -24,6 +24,7 @@
  * Revised: 3-APR-2014			Add dm_scanf(), dm_fscanf().
  * Revised: 7-APR-2014			Add dm_perror() function.
  * Revised:15-APR-2014			Add support for stderr propagation.
+ * Revised:16-APR-2014			Incoporate change to dm_bypass_read.
  */
 #include <stdlib.h>
 #include <stdarg.h>
@@ -36,6 +37,10 @@
 #include <unixio.h>		/* isapipe function */
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errnodef.h>		/* C$_Exxx errno VMS condition codes */
+/* #include <lib$routines.h>
+extern int C$_SIGPIPE; */
 
 #define DM_NO_CRTL_WRAP		/* Don't override CRTL names (pipe, etc) */
 #include "dmpipe.h"
@@ -99,6 +104,13 @@ static struct {
     FILE *fp;
     struct dm_fd_extension *fdx;
 } dm_fp_map[FP_TO_FD_TLB_SIZE] = { {0,0}, {0,0}, {0,0} };
+/*
+ * Broken pipe check raises signal if write to stdout fails. Should be if
+ * write to any pipe fails.
+ */
+#define BROKEN_PIPE_CHECK(sts,fdesc) \
+   if ( ((sts) < 0) && (fdesc<65000) ) /* raise (SIGPIPE); */ \
+   gsignal ( SIGPIPE, 1 );
 /*************************************************************************/
 /*
  * Main functions for managing extension blocks:
@@ -247,6 +259,10 @@ static struct dm_fd_extension *find_fp_extension ( FILE *fp, int init_if )
 
     return fdx;
 }
+static void broken_pipe ( int fd )
+{
+    exit ( EPIPE );
+}
 /*************************************************************************/
 /*
  * Define functional replacements for CRTL I/O routines that bypass
@@ -284,7 +300,7 @@ ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
 	    int count;
-	    count = dm_bypass_read ( fdx->bp, buffer_vp, nbytes );
+	    count = dm_bypass_read ( fdx->bp, buffer_vp, nbytes, nbytes );
 	    if ( count < 0 ) return -1;
 	    return count;
 	}
@@ -312,7 +328,9 @@ ssize_t dm_write ( int fd, void *buffer_vp, size_t nbytes )
 	 * to regular write.
 	 */
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
-	    return dm_bypass_write ( fdx->bp, buffer_vp, nbytes );
+	    status = dm_bypass_write ( fdx->bp, buffer_vp, nbytes );
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
+	    return status;
 	}
     }
 
@@ -459,7 +477,7 @@ size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr )
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
 	    int count;
-	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems );
+	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems, itmsize );
 	    if ( count < 0 ) return 0;
 	    return count /itmsize;
 	}
@@ -489,7 +507,9 @@ size_t dm_fwrite ( const void *ptr, size_t itmsize, size_t nitems,
 	 * to regular write.
 	 */
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
-	    return dm_bypass_write ( fdx->bp, ptr, itmsize*nitems );
+	    status = dm_bypass_write ( fdx->bp, ptr, itmsize*nitems );
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
+	    return status;
 	}
     }
     return fwrite ( ptr, itmsize, nitems, fptr );
@@ -517,7 +537,12 @@ static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
 	    inbuf->rpos = DM_INBUF_LOOKBACK;
 	}
 	count = dm_bypass_read ( fdx->bp, &inbuf->buffer[inbuf->length],
-		DM_INBUF_BUFSIZE-inbuf->length );
+		DM_INBUF_BUFSIZE-inbuf->length, 
+#ifdef MIN_DELAY
+		needed );
+#else
+		DM_INBUF_BUFSIZE-inbuf->length);
+#endif
 	if ( count < 0 ) return -1;
 	inbuf->length += count;
         available = inbuf->length - inbuf->rpos;
@@ -695,7 +720,9 @@ fprintf (tty, "/dmpipe/ FD[%d] partial(,,%d) startup set bypass_flags: %d\n",
 	 * to regular write.
 	 */
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
-	    return dm_bypass_write ( fdx->bp, buffer, length );
+	    count = dm_bypass_write ( fdx->bp, buffer, length );
+	    BROKEN_PIPE_CHECK ( count, fdx->fd );
+	    return count;
 	}
     }
     count = write ( fdx->fd, buffer, length );
@@ -757,7 +784,9 @@ static int vxfprintf ( FILE *fptr, const char *format, va_list ap,
 	    /* Flush buffer */
 	    status2 = unistd_partial_cb ( fdx, buffer, bytes_left );
 	    if ( status2 > 0 ) status += status2;
+	    else if ( status2 < 0 ) status = status2;  /* error */
 	}
+	BROKEN_PIPE_CHECK ( status, fdx->fd );
     } else {
 	/*
 	 * Not bypassing, use routine that goes directly to CRTL.
@@ -1509,10 +1538,60 @@ void dm_perror ( const char *str )
 	    if ( status >= 0 ) status = dm_bypass_write ( fdx->bp, errmsg,
 			strlen(errmsg) );
 	    if ( status >= 0 ) status = dm_bypass_write ( fdx->bp, "\n", 1 );
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
 	    return;
 	}
     }
 
     perror ( str );
     return;
+}
+/*
+ * Flush functions.  Go around bypass layer to get the write stream and call
+ * memstream_flush directly.  If no write stream set up, call CRTL function.
+ */
+static int flush_extension ( struct dm_fd_extension *fdx )
+{
+    memstream rstream, wstream;
+    int status;
+
+    dm_bypass_current_streams ( fdx->bp, &rstream, &wstream );
+    if ( wstream ) {
+	status = memstream_flush ( wstream );
+	BROKEN_PIPE_CHECK ( status, fdx->fd );
+    } else status = EOF;	/* stream not open for write */
+    return status;
+}
+
+int dm_fsync ( int fd )
+{
+    struct dm_fd_extension *fdx;
+
+    fdx = find_extension ( fd, 0 );
+    if ( fdx && fdx->initialized &&
+	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
+	memstream rstream, wstream;
+
+	return flush_extension ( fdx );
+    }
+    /*
+     * Fallback to CRTL function.
+     */
+    return fsync ( fd );
+}
+
+int dm_fflush ( FILE *fptr )
+{
+    struct dm_fd_extension *fdx;
+
+    fdx = find_fp_extension ( fptr, 0 );
+    if ( fdx && fdx->initialized &&
+	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
+
+	return flush_extension ( fdx );
+    }
+    /*
+     * Fallback to CRTL function.
+     */
+    return fflush ( fptr );
 }

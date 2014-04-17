@@ -28,7 +28,7 @@ int dm_bypass_startup_stall ( int intitial_flags, dm_bypass bp, char *op,
 	int fcntl_flags );
 int dm_bypass_negotiate (int initial_flags, dm_bypass bp, char *op, int bytes);
 
-int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes );
+int dm_bypass_read(dm_bypass bp, void *buffer, size_t nbytes, size_t min_bytes);
 int dm_bypass_write ( dm_bypass bp, const void *buffer, size_t nbytes );
 /*
  * dm_bypass_stderr_propagate() is called by parent to convey its stderr

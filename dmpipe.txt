@@ -1,4 +1,4 @@
-								 7-APR-2014
+								17-APR-2014
 
 DMPIPE is a libary of functions to optimize pipe-based communication between
 C-based programs.  When the programs on both sides (writer and reader) of
@@ -14,9 +14,10 @@ implementation is not complete, but intended to show the concept of an
 adaptive approach to high-performance pipes.
 
 List of wrapped CRTL functions:
-    close(), fclose(), fcntl(), fdopen(), fgetc(), fgets(), fprintf(), fopen(),
-    fread(), fscanf(), fwrite(), open(), perror(), pipe(), poll(), popen(), 
-    printf(), read(), scanf(), select(), ungetc(), write()
+    close(), fclose(), fcntl(), fdopen(), fflush(), fgetc(), fgets(), 
+    fprintf(), fopen(), fread(), fscanf(), fsync(), fwrite(), open(), pclose(),
+    perror(), pipe(), poll(), popen(), printf(), read(), scanf(), select(), 
+    ungetc(), write()
 
 
 Source modules:

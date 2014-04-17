@@ -34,7 +34,7 @@ LINKFLAGS = /EXEC=$(MMS$TARGET_NAME).EXE/map/cross
   @ IF f$environment("DEPTH") .gt. 0 then sv_vfy = f$verify(sv_vfy)
 
 images = hmac.exe case_munge.exe case_munge_0.exe hmac_0.exe test_poll.exe -
-	test_poll_0.exe
+	test_poll_0.exe pipe_torture.exe
 
 doscan_objs = doscan.obj doscan_flt_gx.obj doscan_flt_g.obj doscan_flt_dx.obj -
   doscan_flt_d.obj doscan_flt_tx.obj doscan_flt_t.obj
@@ -63,6 +63,9 @@ test_poll.exe : test_poll.obj $(lib_objs) dmpipe.opt
 test_poll_0.exe : test_poll_0.obj $(lib_objs) dmpipe.opt
    link $(LINKFLAGS) test_poll_0.obj,$(doprint_opt_file)/option
 
+pipe_torture.exe : pipe_torture.obj dmpipe.opt
+   link $(LINKFLAGS) pipe_torture.obj,$(doprint_opt_file)/option
+
 $(doprint_opt_file) : $(dmpipe_obj) dmpipe_bypass.obj memstream.obj
    set file $(doprint_opt_file)/ext=0		! touch file
 
@@ -87,6 +90,9 @@ case_munge.obj : case_munge.c dmpipe.h
 
 test_poll.obj : test_poll.c dmpipe.h
    CC $(CFLAGS) test_poll.c
+
+pipe_torture.obj : pipe_torture.c dmpipe.h
+  CC $(CFLAGS) pipe_torture.c
 
 test_poll_0.obj : test_poll.c dmpipe.h
    CC $(CFLAGS) test_poll.c/object=test_poll_0.obj/define=DM_NO_CRTL_WRAP

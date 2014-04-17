@@ -4,7 +4,10 @@
  * the shared memory and the other process is the reader (2-way cata
  * transfer requires 2 streams).
  *
- * Date: 10-MAR-2014
+ * Date:    10-MAR-2014
+ * Revised: 16-APR-2014		Add memstream_flush function, modified
+ *				get_from_commbuf function to support it.
+ *				Add min_bytes argument to memstream_read().
  */
 #include <stdlib.h>
 #include <stddef.h>
@@ -353,8 +356,10 @@ static int get_from_commbuf ( volatile struct commbuf *buf,
 	break;
 
       case MEMSTREAM_STATE_FULL:
-	/* Copy rest of data */
-	if ( segment == 0 ) buf->state = MEMSTREAM_STATE_IDLE;
+	/* Copy rest of data, reset state to IDLE if we consumed all pending */
+	if ( (buf->read_pos+segment) >= buf->write_pos ) {
+	     buf->state = MEMSTREAM_STATE_IDLE;
+	}
 	break;
 
       case MEMSTREAM_STATE_WRITER_DONE:
@@ -711,7 +716,8 @@ int memstream_write ( memstream stream, const void *buffer_vp, int bufsize )
     return bufsize - remaining;
 }
 
-int memstream_read ( memstream stream, void *buffer_vp, int bufsize )
+int memstream_read (
+	memstream stream, void *buffer_vp, int bufsize, int min_bytes )
 {
     int status, remaining, seg, count, retrieved, enter_state, exit_state;
     int defer_wake;
@@ -765,7 +771,7 @@ int memstream_read ( memstream stream, void *buffer_vp, int bufsize )
 	    errno = EIO;
 	    return -1;
 	}
-    } while ( count < bufsize );
+    } while ( count < min_bytes );
 
     return count;
 }
@@ -886,4 +892,72 @@ int memstream_query ( memstream stream,
     *state = exit_state;
 
     return 0;
+}
+/*
+ * Flush function stalls until all written data read by peer.  Convert
+ * a non-empty, idle, buffer to state FULL and wait for change to non-full state.
+ */
+int memstream_flush ( memstream stream )
+{
+    int status, pending, available, enter_state, exit_state;
+    struct commbuf *buf;
+
+    if ( !stream->is_writer ) {		/* not a writer */
+	return EOF;
+    }
+    status = 0;				/* default return value */
+    /*
+     * Lock commbuf and extract header information.
+     */
+    acquire_lock ( stream->buf );
+    buf = stream->buf;
+    enter_state = buf->state;
+    available = buf->data_limit - buf->write_pos;
+    pending = buf->write_pos - buf->read_pos;
+    /*
+     * We only have something to do if bytes waiting to be read.
+     */
+    if ( pending > 0 ) {
+        enter_state = buf->state;
+	switch ( enter_state ) {
+	  case MEMSTREAM_STATE_IDLE:
+	    /*
+	     * Force state to FULL and fall through to state FULL case,
+	     * which we should never actually see on entry.
+	     */
+	    buf->state = MEMSTREAM_STATE_FULL;
+
+	  case MEMSTREAM_STATE_FULL:
+	    /*
+	     * Stall until reader consumes buffer and resets state.
+	     */
+	    while ( buf->state == MEMSTREAM_STATE_FULL ) {
+		release_lock ( buf );
+		hibernate( stream );
+		acquire_lock ( buf );
+	    }
+	    if ( (buf->state != MEMSTREAM_STATE_IDLE) &&
+		 (buf->state != MEMSTREAM_STATE_EMPTY) ) {
+		/* reader closed connection */
+		status = EOF;
+	    }
+	    break;
+
+	  case MEMSTREAM_STATE_WRITER_DONE:
+	  case MEMSTREAM_STATE_READER_DONE:
+	  case MEMSTREAM_STATE_CLOSED:
+	    status = EOF;
+	    break;
+
+	  case MEMSTREAM_STATE_EMPTY:
+	    fprintf(stderr,
+		"/memstream/ bugcheck, commbuf state inconsistent in flsuh\n" );
+	  default:
+	    /* Condition of (pending>0) and reader waiting shouldn't happen */
+	    status = EOF;
+	    break;
+	}
+    }
+    release_lock ( buf );
+    return status;
 }
