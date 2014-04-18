@@ -25,6 +25,7 @@
  * Revised: 7-APR-2014			Add dm_perror() function.
  * Revised:15-APR-2014			Add support for stderr propagation.
  * Revised:16-APR-2014			Incoporate change to dm_bypass_read.
+ * Revised:17-APR-2014			Support expedite flag (flush).
  */
 #include <stdlib.h>
 #include <stdarg.h>
@@ -39,8 +40,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errnodef.h>		/* C$_Exxx errno VMS condition codes */
-/* #include <lib$routines.h>
-extern int C$_SIGPIPE; */
+#include <lib$routines.h>
 
 #define DM_NO_CRTL_WRAP		/* Don't override CRTL names (pipe, etc) */
 #include "dmpipe.h"
@@ -94,6 +94,7 @@ static struct dm_fd_extension dm_fd_ext_row0[FD_EXTENSION_MAP_COLS] = {
 static struct dm_fd_extension *dm_fd_extrow[FD_EXTENSION_MAP_ROWS] = {
     dm_fd_ext_row0, 0, 0, 0, 0, 0 ,0, 0, 0 
 };
+static int inbuf_min_delay_control = 0;
 static FILE *tty = 0;
 /*
  * For functions that use a *FILE argument, keep a small cache of their
@@ -105,8 +106,9 @@ static struct {
     struct dm_fd_extension *fdx;
 } dm_fp_map[FP_TO_FD_TLB_SIZE] = { {0,0}, {0,0}, {0,0} };
 /*
- * Broken pipe check raises signal if write to stdout fails. Should be if
- * write to any pipe fails.
+ * Broken pipe check raises signal if write to pipes fail.  DECC uses
+ * SIGPIPE for multiple exceptions, raise with gsignal() to provide
+ * the proper subcode for C$_SIGPIPE.
  */
 #define BROKEN_PIPE_CHECK(sts,fdesc) \
    if ( ((sts) < 0) && (fdesc<65000) ) /* raise (SIGPIPE); */ \
@@ -286,7 +288,7 @@ int dm_pipe ( int fds[2] )
 
 ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
 {
-    int status;
+    int status, expedite_flag;
     struct dm_fd_extension *fdx;
 
     fdx = find_extension ( fd, 1 );
@@ -300,7 +302,7 @@ ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
 	    int count;
-	    count = dm_bypass_read ( fdx->bp, buffer_vp, nbytes, nbytes );
+	    count = dm_bypass_read ( fdx->bp, buffer_vp, nbytes, nbytes, 0 );
 	    if ( count < 0 ) return -1;
 	    return count;
 	}
@@ -309,7 +311,7 @@ ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
     return read ( fd, buffer_vp, nbytes );
 }
 
-ssize_t dm_write ( int fd, void *buffer_vp, size_t nbytes )
+ssize_t dm_write ( int fd, const void *buffer_vp, size_t nbytes )
 {
     int status;
     struct dm_fd_extension *fdx;
@@ -359,12 +361,40 @@ int dm_close ( int file_desc )
     return close ( file_desc );
 }
 
-int dm_open ( const char *file_spec, int flags, mode_t mode )
+int dm_open ( const char *file_spec, int flags, ... )
 {
-    int status, fd;
+    int status, count, fd, i;
     struct dm_fd_extension *fdx;
+    void *arg3_vp;
+    va_list ap;
+    /*
+     * Support standard open arguments and DEC extension.  VMS doesn't
+     * map first page of address space, so value < 512 is assumed to be
+     * a bit mask (mode).
+     */
+    va_count(count);	/* argument count */
+    va_start(ap,flags);
+    arg3_vp = va_arg(ap, void *);
 
-    fd = open ( file_spec, flags, mode );
+    if ( ((unsigned int) arg3_vp) < 512 ) {
+	fd = open ( file_spec, flags, (mode_t) arg3_vp );
+    } else {
+	/*
+	 * Copy the argument list.
+	 */
+	union arglist{ void *vp; unsigned long ul; } *args;
+	args = calloc ( count+1, sizeof(union arglist) );
+	args[0].ul = count;
+	args[1].vp = (void *) file_spec;
+	args[2].ul = flags;
+	args[3].vp = arg3_vp;
+	for ( i = 4; 4 <= count; i++ ) args[i].vp = va_arg(ap, void *);
+
+	fd = LIB$CALLG ( args, open );
+	free ( args );
+    }
+    va_end(ap);
+
     if ( fd < 0 ) return fd;
 
     fdx = find_extension ( fd, 1 );
@@ -477,7 +507,7 @@ size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr )
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
 	    int count;
-	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems, itmsize );
+	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems, itmsize,0 );
 	    if ( count < 0 ) return 0;
 	    return count /itmsize;
 	}
@@ -518,12 +548,27 @@ size_t dm_fwrite ( const void *ptr, size_t itmsize, size_t nitems,
 static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
 {
     struct dm_inbuf *inbuf;
-    int available, count;
+    int available, count, expedite_flag;
     /*
-     * Create inbuf if first call.
+     * Create inbuf if first call.  Also set min_delay_control flag
+     * to 1 (yes) or 2 (no) by checking environment variable.
      */
     if ( !fdx->inbuf ) fdx->inbuf = calloc ( sizeof(struct dm_inbuf), 1 );
     if ( !fdx->inbuf ) return -1;
+    if ( inbuf_min_delay_control == 0 ) {
+	char *envvar = getenv ( "DMPIPE_INBUF_MIN_DELAY" );
+	inbuf_min_delay_control = 2;
+	if ( envvar ) {
+	    if ( isdigit ( *envvar ) ) {
+		inbuf_min_delay_control  = atoi ( envvar );
+		if ( inbuf_min_delay_control != 1 ) inbuf_min_delay_control =2;
+	    } else if ( strncasecmp ( envvar, "E", 1 ) == 0 ) {
+		inbuf_min_delay_control = 1;
+	    } else if ( strncasecmp ( envvar, "T", 1 ) == 0 ) {
+		inbuf_min_delay_control = 1;
+	    }
+	}
+    }
 
     inbuf = fdx->inbuf;
     available = inbuf->length - inbuf->rpos;
@@ -537,15 +582,15 @@ static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
 	    inbuf->rpos = DM_INBUF_LOOKBACK;
 	}
 	count = dm_bypass_read ( fdx->bp, &inbuf->buffer[inbuf->length],
-		DM_INBUF_BUFSIZE-inbuf->length, 
-#ifdef MIN_DELAY
-		needed );
-#else
-		DM_INBUF_BUFSIZE-inbuf->length);
-#endif
+		DM_INBUF_BUFSIZE-inbuf->length, (inbuf_min_delay_control==1) ?
+		needed : (DM_INBUF_BUFSIZE-inbuf->length), &expedite_flag );
 	if ( count < 0 ) return -1;
 	inbuf->length += count;
         available = inbuf->length - inbuf->rpos;
+	/*
+	 * Cut short attempt to fill buffer if peer set expedite flag.
+	 */
+	if ( expedite_flag ) break;
     }
     return 0;
 }
@@ -617,7 +662,7 @@ int dm_ungetc ( int c, FILE *fptr )
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
 	    unsigned char *ucp;
-	    if ( 0 == load_inbuf ( fdx, 1 ) ) {
+	    if ( 0 == load_inbuf ( fdx, 0 ) ) {
 		if ( fdx->inbuf->rpos > 0 ) {
 		    --fdx->inbuf->rpos;
 	            ucp = (unsigned char *) fdx->inbuf->rpos;

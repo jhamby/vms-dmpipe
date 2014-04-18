@@ -8,6 +8,13 @@
  * Revised: 16-APR-2014		Add memstream_flush function, modified
  *				get_from_commbuf function to support it.
  *				Add min_bytes argument to memstream_read().
+ *
+ * Revised: 17-APR-2014		One more crack at flush function. Consolitate
+ *				3 arguments to commbuf operations into
+ *				a single returned structure that adds a flags
+ *				field as well to convey flush requests.
+ *				commbuf format version bumped to 2 due to
+ *				addtion of comm_flags structure.
  */
 #include <stdlib.h>
 #include <stddef.h>
@@ -22,6 +29,7 @@
 #include <builtins.h>			/* DEC C builtin functions */
 
 #include "memstream.h"
+static FILE *tty;
 /*
  * Glocal parameters for spin lock and exit handler.
  */
@@ -55,7 +63,9 @@ static struct {
     0, 0, 2, &rundown.status, &rundown.open_streams
 };
 /*
- * Block in shared memory used to transfer data.
+ * Communication buffer is the shared memory between processes, so must
+ * must be synchonized using the lock member and offset 16;  The longwords
+ * on either side of the lock structure are more or less static.
  */
 union lock_state {
     struct {
@@ -63,6 +73,13 @@ union lock_state {
 	pid_t owner;
     } state;
     long long state_qw;			/* for atomic exchange */
+};
+union comm_flags {
+    struct {
+	unsigned int expedite:  1,	/* reader should flush */
+	             reserved: 30;	/* fill out longword */
+    } bit;
+    unsigned long mask;
 };
 struct commbuf {
     unsigned short fmt_version;
@@ -75,15 +92,16 @@ struct commbuf {
 #pragma member_alignment restore
     int data_limit;			/* amount that can be buffered */
     int state;				/* Communication state. */
+    union comm_flags flags;		/* additional inter-process comm */
     int write_pos;			/* Offset of next byte to write */
     int read_pos;			/* offset of next byte to read */
 
-    char data[8];			/* variable size */
+    char data[4];			/* variable size */
 };
-#define MEMSTREAM_FMT_VERSION 1
+#define MEMSTREAM_FMT_VERSION 2		/* added flags field */
 #define MEMSTREAM_IPC_VERSION 1
 /*
- * Commbuf states:
+ * 6 commbuf states.
  */
 #define MEMSTREAM_STATE_IDLE 0		/* not full and space available */
 #define MEMSTREAM_STATE_EMPTY 1		/* empty and reader waiting */
@@ -99,12 +117,23 @@ struct commbuf {
 #define COMMBUF_DISCARDED 4		/* Data discarded, pipe closed */
 #define COMMBUF_ABORT 8			/* Unexpected error */
 /*
+ * Commbuf_report struct saves details of get/put opersion while buffer locked
+ * is held which we can examine after lock is released.
+ */
+struct commbuf_report {
+   int enter_state;			/* commbuf->state at lock acquisition */
+   union comm_flags flags;		/* additional notification */
+   int exit_state;			/* commbuf->state at lock release */
+   int transferred;			/* bytes transferred */
+};
+/*
  * memstream_context structure is created by memstream_create function to
  * hold context.
  */
 struct memstream_context {
     struct memstream_context *next;	/* list used by exit handler */
     struct commbuf *buf;		/* Shared buffer */
+    union comm_flags flags;		/* flags on last read */
     int is_writer;			/* Indicates which end of stream */
     int attributes;			/* control flags */
     struct memstream_stats *stats;      /* Optional. */
@@ -225,8 +254,7 @@ static int release_lock ( volatile struct commbuf *buf )
  *    CLOSED        *           0       discontinue I/O attempts.
  */
 static int put_to_commbuf ( const void *bytes_vp, int count, 
-	volatile struct commbuf *buf, int *written, 
-	int *enter_state, int *exit_state )
+	volatile struct commbuf *buf, struct commbuf_report *report )
 {
     int spin_result, available, segsize, kick_reader, status;
     volatile char *dest;
@@ -237,7 +265,8 @@ static int put_to_commbuf ( const void *bytes_vp, int count,
      * Obtain mutex (spin lock).
      */
     acquire_lock ( buf );
-    *enter_state = buf->state;
+    report->enter_state = buf->state;
+    report->flags.mask = 0;
     /*
      * Determine amount of caller's buffer to write (segsize), smaller of
      * amount to be written, seg_limit, or space left in buffer.
@@ -301,19 +330,18 @@ static int put_to_commbuf ( const void *bytes_vp, int count,
 	__MEMCPY ( (void *) dest, bytes, segsize );
 	buf->write_pos += segsize;
     }
-    *written = segsize;
     /*
-     * Release mutex.
+     * Save result and release mutex.
      */
-    *exit_state =  buf->state;
+    report->exit_state = buf->state;
+    report->transferred = segsize;
     release_lock ( buf );
 
     return status;
 }
 
 static int get_from_commbuf ( volatile struct commbuf *buf,
-	void *bytes_vp, int limit, int *retrieved, 
-	int *enter_state, int *exit_state )
+	void *bytes_vp, int limit, struct commbuf_report *report )
 {
     int spin_result, available, segment, kick_reader, status;
     volatile char *src;
@@ -324,7 +352,8 @@ static int get_from_commbuf ( volatile struct commbuf *buf,
      * Obtain mutex (spin lock).
      */
     acquire_lock ( buf );
-    *enter_state = buf->state;
+    report->enter_state = buf->state;
+    report->flags.mask = 0;
     /*
      * Determine amount of caller's buffer to fill (segment), smaller of
      * amount to be copied, seg_limit, or data available.
@@ -352,6 +381,10 @@ static int get_from_commbuf ( volatile struct commbuf *buf,
 	status = COMMBUF_BLOCKED;
 	if ( buf->writer_pid == 0 ) {
 	     status = COMMBUF_DISCARDED;
+	} else {
+	     /* Pass along expedite bit status if writer set it */
+	     report->flags.bit.expedite = buf->flags.bit.expedite;
+	     buf->flags.bit.expedite = 0;
 	}
 	break;
 
@@ -359,6 +392,8 @@ static int get_from_commbuf ( volatile struct commbuf *buf,
 	/* Copy rest of data, reset state to IDLE if we consumed all pending */
 	if ( (buf->read_pos+segment) >= buf->write_pos ) {
 	     buf->state = MEMSTREAM_STATE_IDLE;
+	     report->flags.bit.expedite = buf->flags.bit.expedite;
+	     buf->flags.bit.expedite = 0;
 	}
 	break;
 
@@ -397,11 +432,11 @@ static int get_from_commbuf ( volatile struct commbuf *buf,
 	    }
 	}
     }
-    *retrieved = segment;
     /*
-     * Release mutex.
+     * Save final result and release mutex.
      */
-    *exit_state = buf->state;
+    report->exit_state = buf->state;
+    report->transferred = segment;
     release_lock ( buf );
 
     return status;
@@ -649,8 +684,8 @@ int memstream_assign_statistics ( memstream stream,
  */
 int memstream_write ( memstream stream, const void *buffer_vp, int bufsize )
 {
-    int status, remaining, deferred_wake, seg, count, written;
-    int enter_state, exit_state;
+    int status, remaining, deferred_wake, seg, count;
+    struct commbuf_report report;
     const char *buffer;
     /*
      * Prepare for main lopp.
@@ -663,18 +698,17 @@ int memstream_write ( memstream stream, const void *buffer_vp, int bufsize )
      * Call put_to_commbuf as many times as needed to transfer caller's buffer.
      * Put_to_commbuf transfer at most spn.seg_limit bytes at a time.
      */
-    for ( remaining = bufsize; remaining > 0; remaining -= written ) {
-	status = put_to_commbuf ( buffer, remaining, stream->buf,
-		&written, &enter_state, &exit_state );
-	if ( stream->stats && (written>0) ) stream->stats->segments++;
+    for ( remaining=bufsize; remaining > 0; remaining -= report.transferred ) {
+	status = put_to_commbuf ( buffer, remaining, stream->buf, &report );
+	if (stream->stats && (report.transferred>0)) stream->stats->segments++;
 	if ( status == COMMBUF_COMPLETED ) {
 	    /*
 	     * Skip over buffer we wrote and note if we should wake reader.
 	     * Defer wake until we finish write or block to minimize
              * thrashing.
 	     */
-	    buffer += written;
-	    if ( enter_state == MEMSTREAM_STATE_EMPTY ) deferred_wake = 1;
+	    buffer += report.transferred;
+	    if (report.enter_state == MEMSTREAM_STATE_EMPTY) deferred_wake = 1;
 
 	} else if ( status == COMMBUF_BLOCKED ) {
 	    /*
@@ -686,7 +720,7 @@ int memstream_write ( memstream stream, const void *buffer_vp, int bufsize )
 		errno = EWOULDBLOCK;	/* rethink */
 		return -1;
 	    }
-	    buffer += written;
+	    buffer += report.transferred;
     	    if ( deferred_wake ) {
 		deferred_wake = 0;
 		wake_peer ( stream );
@@ -715,45 +749,61 @@ int memstream_write ( memstream stream, const void *buffer_vp, int bufsize )
     if ( deferred_wake ) wake_peer ( stream );
     return bufsize - remaining;
 }
-
-int memstream_read (
-	memstream stream, void *buffer_vp, int bufsize, int min_bytes )
+/*
+ * Read fuctino returns number of bytes read from memstream.  If count
+ * returned is less than min_bytes:
+ *    -1    Condition saved in errno: EWOULDBLOCK, EIO, EPIPE
+ *     0    
+ */
+int memstream_read ( memstream stream, void *buffer_vp, int bufsize, 
+	int min_bytes, int *expedite_flag )
 {
-    int status, remaining, seg, count, retrieved, enter_state, exit_state;
-    int defer_wake;
+    int status, remaining, seg, count, defer_wake;
+    struct commbuf_report report;
     char *buffer;
 
     if ( stream->stats ) stream->stats->operations++;
     count = 0;
     buffer = buffer_vp;
+    *expedite_flag = 0;
     /*
      * Transfer bytes from shared buffer to caller's buffer in chunks until
      * bufsize moved or stream closed.
      */
     do {
-	status = get_from_commbuf ( stream->buf, buffer, bufsize-count, 
-		&seg, &enter_state, &exit_state );
+	status = get_from_commbuf(stream->buf, buffer, bufsize-count, &report);
+	seg = report.transferred;
 	if ( seg > 0 ) {
 	    count += seg;
 	    buffer += seg;
 	    if ( stream->stats ) stream->stats->segments++;
 	}
 	if ( status == COMMBUF_COMPLETED ) {
-	    if ( enter_state == MEMSTREAM_STATE_FULL ) {
+	    if ( report.enter_state == MEMSTREAM_STATE_FULL ) {
 		/*
 		 * Writer filled buffer and is waiting for us to flush
 		 * it, which may take multiple gets.  Defer wake until
 		 * commbuf_get returned all data and flips state to IDLE.
 		 */
-		if ( exit_state == MEMSTREAM_STATE_IDLE ) {
+		if ( report.exit_state == MEMSTREAM_STATE_IDLE ) {
 		    wake_peer ( stream );
 		    /* If we have read something, return now to let it
 		       be processed rather than wait on writer */
+		    /* check for expedite */
+		    if ( report.flags.bit.expedite ) {
+			*expedite_flag = 1;
+			break;
+		    }
 		    if ( count > 0 ) break;
 		}
 	    }
 	} else if ( status == COMMBUF_BLOCKED ) {
 	    /* No data, wait and retry. */
+	    if ( report.flags.bit.expedite ) {
+		/* writer is performing a flush */
+		*expedite_flag = 1;
+		break;
+	    }
 	    if ( stream->attributes&MEMSTREAM_ATTR_NONBLOCK ) {
 		/* Return bytes read or EWOULDBLOCK error */
 		if ( count == 0 ) {
@@ -909,15 +959,17 @@ int memstream_flush ( memstream stream )
     /*
      * Lock commbuf and extract header information.
      */
+if ( !tty ) tty = fopen ( "DBG$OUTPUT", "w" );
     acquire_lock ( stream->buf );
     buf = stream->buf;
     enter_state = buf->state;
     available = buf->data_limit - buf->write_pos;
     pending = buf->write_pos - buf->read_pos;
     /*
-     * We only have something to do if bytes waiting to be read.
+     * We only have something to do if bytes waiting to be read or
+     * if peer is wait for data.
      */
-    if ( pending > 0 ) {
+    if ( (pending > 0) || (buf->state == MEMSTREAM_STATE_EMPTY) ) {
         enter_state = buf->state;
 	switch ( enter_state ) {
 	  case MEMSTREAM_STATE_IDLE:
@@ -925,22 +977,26 @@ int memstream_flush ( memstream stream )
 	     * Force state to FULL and fall through to state FULL case,
 	     * which we should never actually see on entry.
 	     */
-	    buf->state = MEMSTREAM_STATE_FULL;
 
 	  case MEMSTREAM_STATE_FULL:
 	    /*
-	     * Stall until reader consumes buffer and resets state.
+	     * Repeatedly stall until reader consumes buffer and resets state.
 	     */
-	    while ( buf->state == MEMSTREAM_STATE_FULL ) {
-		release_lock ( buf );
-		hibernate( stream );
-		acquire_lock ( buf );
-	    }
-	    if ( (buf->state != MEMSTREAM_STATE_IDLE) &&
-		 (buf->state != MEMSTREAM_STATE_EMPTY) ) {
-		/* reader closed connection */
-		status = EOF;
-	    }
+	    do {
+	        buf->state = MEMSTREAM_STATE_FULL;
+		buf->flags.bit.expedite = 1;
+	        while ( buf->state == MEMSTREAM_STATE_FULL ) {
+		    release_lock ( buf );
+		    hibernate( stream );
+		    acquire_lock ( buf );
+	        }
+	        if ( (buf->state != MEMSTREAM_STATE_IDLE) &&
+		     (buf->state != MEMSTREAM_STATE_EMPTY) ) {
+		    /* reader closed connection */
+		    status = EOF;
+		    break;
+	        }
+	    } while ( buf->read_pos < buf->write_pos );
 	    break;
 
 	  case MEMSTREAM_STATE_WRITER_DONE:
@@ -950,6 +1006,9 @@ int memstream_flush ( memstream stream )
 	    break;
 
 	  case MEMSTREAM_STATE_EMPTY:
+	    buf->flags.bit.expedite = 1;
+	    wake_peer ( stream );
+	    break;
 	    fprintf(stderr,
 		"/memstream/ bugcheck, commbuf state inconsistent in flsuh\n" );
 	  default:

@@ -37,14 +37,14 @@ struct test_data {
 #define NUM_TESTS 11
 
 struct test_data tests[NUM_TESTS] = {
-    {  10,  10,  0,  10, 1, "w",   /* 1 */
+    {  10,  10,  0,  10, 0, "w",   /* 1 */
       "child sleeps after parent closes; should see 10 writes, then 10 reads" },
     {  10,  10,  0,   0, 0, "w",
       "child exits when finished; should see 10 writes, then 10 reads" },
     {  10,   5,  0,   5, 0, "w",
       "child writes 10, parent reads 5 and closes; should see 10 writes, 5 reads" },
     {  10,   5,  0,   5, 1, "w",
-      "child s writes/flushes 10, parent reads 5 and closes; should see 6 writes, 5 reads" },
+      "child writes/flushes 10, parent reads 5 and closes; should see 6 writes, 5 reads" },
     {   5,  10,  0,   0, 0, "w",  /* 5 */
       "child writes 5, parent reads 10; should see 5 writes, 5 reads, 5 EOFs" },
     { 100, 100,  0,   0, 0, "w",
@@ -137,7 +137,7 @@ int main(int argc, char *argv[]) {
         }
         if (parent_mode[0] == 'r') {
             for (i = 1; i <= tests[testnum-1].num_parent_ops; i++) {
-                if (!fgets(readbuf, READBUF_SIZE, pipe_fp))
+                if (!dm_fgets(readbuf, READBUF_SIZE, pipe_fp))
                     strcpy(readbuf, "<EOF>\n");
                 printf("parent read from child (%d/%d): %s",
                        i,

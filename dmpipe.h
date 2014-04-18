@@ -20,9 +20,9 @@
 
 int dm_pipe ( int fds[2] );
 ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes );
-ssize_t dm_write ( int fd, void *buffer_vp, size_t nbytes );
+ssize_t dm_write ( int fd, const void *buffer_vp, size_t nbytes );
 int dm_close ( int file_desc );
-int dm_open ( const char *file_spec, int flats, mode_t mode );
+int dm_open ( const char *file_spec, int flats, ... );
 int dm_dup ( int file_desc );
 int dm_dup2 ( int file_desc1, int file_desc2 );
 
@@ -155,29 +155,7 @@ int dm_scanf_t ( const char *fmt, ... );
 #endif /* DM_NO_CRTL_WRAP */
 
 #ifdef DM_WRAP_MAIN
-#include <signal.h>
-#include <errnodef.h>
-static void exit_on_EPIPE ( int sig, ... )
-{
-    exit ( C$_SIGPIPE );
-}
-int main ( int argc, char **argv, char **envp )
-{
-    int status, dm_wrapped_main();
-    struct pollfd poll_set[2] = { { -1, POLLIN, 0 }, { -1, POLLOUT, 0 } };
-    /*
-     * When stdin is a pipe, do a poll to force init of bypass so upstream
-     * writers get a broken pipe instead of DCL reading it.
-     */
-    /* if ( isapipe ( 0 ) ) */ poll_set[0].fd = 0;
-    if ( isapipe ( 1 ) ) poll_set[1].fd = 1;
-    if ( (poll_set[0].fd==0) || (poll_set[1].fd==1) ) dm_poll(poll_set, 2, 0);
-
-    ssignal ( SIGPIPE, exit_on_EPIPE );
-    status = dm_wrapped_main ( argc, argv, envp );
-    return status;
-}
-#define main dm_wrapped_main
+#include "dmpipe_main.c"	/* main application's main a wrapped function */
 #endif /* DM_WRAP_MAIN */
 
 #endif /* DM_PIPE_H */

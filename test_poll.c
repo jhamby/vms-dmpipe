@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <unixio.h>
 #include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -232,7 +233,7 @@ monitor_children ( struct child_control *slave, int slave_count, int timeout )
 static void child_mode ( int arg_c, char **arg_v )
 {
     char message[80];
-    char *child_out_fd, line[80];
+    char *child_out_fd, *diag, line[80];
     FILE *tty;
     pid_t self;
     int out_fd, count, delay, i;
@@ -266,7 +267,16 @@ static void child_mode ( int arg_c, char **arg_v )
     /*
      * Write another line to start off to see how the master process reads it.
      */
-    sprintf ( line, "child %X startup done\n", self );
+    diag = getenv ( "TEST_POLL_DIAG" );
+    if ( diag ) {
+	char *envval;
+	envval = getenv ( diag );
+	if ( !envval ) envval = "(nope)";
+	sprintf ( line, "child %X, isapipe=(%d,%d,%d), v=%s\n",
+		self, isapipe(0), isapipe(1), isapipe(2), envval );
+    } else {
+        sprintf ( line, "child %X startup done\n", self );
+    }
     count = write ( out_fd, line, strlen(line) );
     if ( count < 0 ) fprintf ( tty, "Write error" );
     /*
@@ -299,7 +309,7 @@ int main ( int argc, char **argv, char **envp )
     */
     if ( argc > 2 ) {
 	/*
-	 * allocate array of child control blocks.
+	 * We are parent, allocate array of child control blocks.
 	 */
 	child_count = argc - 2;
 	child = calloc ( sizeof(struct child_control), child_count );

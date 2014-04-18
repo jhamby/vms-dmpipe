@@ -82,16 +82,16 @@ dmpipe_bypass.obj : dmpipe_bypass.c dmpipe_bypass.h memstream.h
 ! User applications should only need to include dmpipe.h
 ! the '_0' version is compiled without enable_bypass.
 !
-hmac.obj : hmac.c dmpipe.h
-   CC $(CFLAGS) hmac.c  /define=ENABLE_BYPASS
+hmac.obj : hmac.c dmpipe.h dmpipe_main.c
+   CC $(CFLAGS) hmac.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
 
-case_munge.obj : case_munge.c dmpipe.h
-  CC $(CFLAGS) case_munge.c  /define=ENABLE_BYPASS
+case_munge.obj : case_munge.c dmpipe.h dmpipe_main.c
+  CC $(CFLAGS) case_munge.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
 
 test_poll.obj : test_poll.c dmpipe.h
    CC $(CFLAGS) test_poll.c
 
-pipe_torture.obj : pipe_torture.c dmpipe.h
+pipe_torture.obj : pipe_torture.c dmpipe.h dmpipe_main.c
   CC $(CFLAGS) pipe_torture.c
 
 test_poll_0.obj : test_poll.c dmpipe.h

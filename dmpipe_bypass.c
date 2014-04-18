@@ -14,6 +14,8 @@
  *				child of popen() call to inherit parent's
  *				stderr instead of pipe open as sys$output.
  *				Add min_bytes argument to dm_bypass_read.
+ *
+ * Revised:  17-APR-2014	Add expedite_flag to dm_bypass_read.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -1185,9 +1187,12 @@ int dm_bypass_shutdown ( dm_bypass bp )
 /*
  * I/O routines, mostly just pass through to memstream layer.
  */
-int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes, size_t min_bytes )
+int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes, 
+	size_t min_bytes, int *expedite_flag )
 {
-    return memstream_read ( bp->nexus->rstream, buffer, nbytes, min_bytes );
+    int doesnt_care;
+    return memstream_read ( bp->nexus->rstream, buffer, nbytes, min_bytes,
+	expedite_flag ? expedite_flag : &doesnt_care );
 }
 int dm_bypass_write ( dm_bypass bp, const void *buffer, size_t nbytes )
 {
