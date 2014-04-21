@@ -232,13 +232,33 @@ monitor_children ( struct child_control *slave, int slave_count, int timeout )
  */
 static void child_mode ( int arg_c, char **arg_v )
 {
-    char message[80];
+    char message[80], errfile[256], outfile[256];
     char *child_out_fd, *diag, line[80];
     FILE *tty;
     pid_t self;
     int out_fd, count, delay, i;
 
     tty = fopen ( "TT:", "w" );
+    if  ( !getname(2,errfile) ) strcpy ( errfile, "{errfile}" );
+    if ( strncmp(errfile,"SYS$ERROR:",10) == 0 ) {
+	char *errtrn, marker;
+	errtrn = getenv("SYS$ERROR");
+	if ( (errtrn[0] == 27) && (errtrn[1] == 0) ) {
+	    memmove ( errtrn, errtrn+4, strlen(&errtrn[4])+1 );
+	    marker='*';
+	} else marker='-';
+	sprintf ( errfile, "%c>%s", marker, errtrn );
+    }
+    if  ( !getname(1,outfile) ) strcpy ( outfile, "{outfile}" );
+    if ( strncmp(outfile,"SYS$OUTPUT:",11) == 0 ) {
+	char *errtrn, marker;
+	errtrn = getenv("SYS$OUTPUT");
+	if ( (errtrn[0] == 27) && (errtrn[1] == 0) ) {
+	    memmove ( errtrn, errtrn+4, strlen(&errtrn[4])+1 );
+	    marker = '*';
+	} else marker = '-';
+	sprintf ( outfile, "%c>%s", marker, errtrn );
+    }
     /*
      * See if we are the initial (vfork/exec) child or a scondary (popen)
      * child by checking for special variable added to environment
@@ -251,8 +271,8 @@ static void child_mode ( int arg_c, char **arg_v )
 	 * Decode the fd and write out first message immediately.
 	 */
 	out_fd = atoi ( child_out_fd );
-	sprintf ( message, "Primary child, pid=%X, output_fd=%d\n", 
-		self, out_fd );
+	sprintf ( message, "Primary child, pid=%X, output_fd=%d, files=%s/%s\n", 
+		self, out_fd, outfile, errfile );
 	count = write ( out_fd, message, strlen(message) );
 
     } else {
@@ -262,7 +282,8 @@ static void child_mode ( int arg_c, char **arg_v )
 	 * multiple opens to same mailbox.
 	 */
 	out_fd = fileno(stdout);	/* popen openned pipe on stdout */
-	fprintf ( stderr, "secondary child starting, pid=%X\n", self );
+	fprintf ( stderr, "secondary child starting, pid=%X, files=%s/%s\n", 
+		self, outfile, errfile );
     }
     /*
      * Write another line to start off to see how the master process reads it.

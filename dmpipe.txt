@@ -1,4 +1,4 @@
-								17-APR-2014
+								21-APR-2014
 
 DMPIPE is a libary of functions to optimize pipe-based communication between
 C-based programs.  When the programs on both sides (writer and reader) of
@@ -40,6 +40,9 @@ Source modules:
 			wrapper functions in dmpipe.c.  Additionally, a
 			dm_fnctl() wrapper function was added to support
 			setting memstream pipes nonblocking.
+
+    dopipe_main.c	Wrapper for application main() function, included
+			as part of dmpipe.h when macro DM_WRAP_MAIN defined.
 
     doscan.c		Functions to support dm_scanf() and dm_fscanf(). The
     doscan_flt_all.c	format specification string proesseed against pipe

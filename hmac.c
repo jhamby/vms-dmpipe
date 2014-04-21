@@ -75,7 +75,7 @@ int main ( int argc, char **argv )
 	        if ( (i > 1) && (command[i-1] == ')') ) command[i-1] = 0;
 	        inp = popen ( command, "r" );
 	    } else {
-	        inp = fopen ( argv[argndx], "r" );
+	        inp = fopen ( argv[argndx], "r", "rop=rah" );
 	    }
 	    if ( !inp ) { perror ( "input stream" ); return 44; }
         } else inp = stdin;

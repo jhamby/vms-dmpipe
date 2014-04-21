@@ -11,6 +11,7 @@
  *
  * Author:  David Jones
  * Date:    17-APR-2014
+ * Revised: 19-APR-2014		Fix isapipe calls and change to dm_isapipe().
  */
 #include <signal.h>
 #include <errnodef.h>
@@ -35,14 +36,14 @@ static void exit_on_EPIPE ( int sig, ... )
  */
 int main ( int argc, char **argv, char **envp )
 {
-    int status, dm_wrapped_main();
+    int status, bp_status, dm_wrapped_main();
     struct pollfd poll_set[2] = { { -1, POLLIN, 0 }, { -1, POLLOUT, 0 } };
     /*
      * When stdin is a pipe, do a poll to force init of bypass so upstream
      * writers get a broken pipe instead of DCL reading it.
      */
-    poll_set[0].fd = 0;
-    poll_set[1].fd = 1;
+    if ( dm_isapipe(0,&bp_status) ) poll_set[0].fd = 0;
+    if ( dm_isapipe(1,&bp_status) ) poll_set[1].fd = 1;
     if ( (poll_set[0].fd==0) || (poll_set[1].fd==1) ) dm_poll(poll_set, 2, 0);
     /*
      * Set up signal handler to catch SIGPIPE and call the real main() routine,

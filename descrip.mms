@@ -63,7 +63,7 @@ test_poll.exe : test_poll.obj $(lib_objs) dmpipe.opt
 test_poll_0.exe : test_poll_0.obj $(lib_objs) dmpipe.opt
    link $(LINKFLAGS) test_poll_0.obj,$(doprint_opt_file)/option
 
-pipe_torture.exe : pipe_torture.obj dmpipe.opt
+pipe_torture.exe : pipe_torture.obj $(lib_objs) dmpipe.opt
    link $(LINKFLAGS) pipe_torture.obj,$(doprint_opt_file)/option
 
 $(doprint_opt_file) : $(dmpipe_obj) dmpipe_bypass.obj memstream.obj

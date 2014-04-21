@@ -13,6 +13,7 @@
  */
 #include <stdio.h>
 #include <unistd.h>		/* pipe definitions, pipe(), close() */
+#include <unixio.h>		/* isapipe() */
 #include <fcntl.h>		/* open() */
 #include <poll.h>		/* poll() and friends */
 #include <socket.h>		/* select() was implemented by TCP/IP dev. */
@@ -46,6 +47,7 @@ int dm_poll ( struct pollfd filedes[], nfds_t nfds, int timeout );
 void dm_perror ( const char *str );
 int dm_fflush ( FILE *fptr );
 int dm_fsync ( int fd );
+int dm_isapipe ( int fd, int *bypass_status );  /* note additional argument */
 /*
  * Statistics retreival.
  */
@@ -151,7 +153,8 @@ int dm_scanf_t ( const char *fmt, ... );
 #define poll dm_poll
 #define select dm_select
 #define fflush dm_fflush
-#define fsynch dm_fsync
+#define fsync dm_fsync
+#define isapipe(fd) dm_isapipe((fd),0)
 #endif /* DM_NO_CRTL_WRAP */
 
 #ifdef DM_WRAP_MAIN

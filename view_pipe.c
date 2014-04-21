@@ -121,6 +121,13 @@ union lock_state {
     } state;
     long long state_qw;			/* for atomic exchange */
 };
+union comm_flags {
+    struct {
+	unsigned int expedite:  1,	/* reader should flush */
+	             reserved: 30;	/* fill out longword */
+    } bit;
+    unsigned long mask;
+};
 struct commbuf {
     unsigned short fmt_version;
     unsigned short ipc_version;
@@ -132,6 +139,7 @@ struct commbuf {
 #pragma member_alignment restore
     int data_limit;			/* amount that can be buffered */
     int state;				/* Communication state. */
+    union comm_flags flags;
     int write_pos;			/* Offset of next byte to write */
     int read_pos;			/* offset of next byte to read */
 
@@ -327,8 +335,15 @@ int main ( int argc, char **argv )
 	printf ( "   buf->lock: flag=%d, owner=%d\n", buf->lock.state.flag,
 		buf->lock.state.owner );
 
-	printf ( "   buf->data_limit=%d, state=%d, write_pos=%d, read_pos=%d\n",
-		buf->data_limit, buf->state, buf->write_pos, buf->read_pos );
+	printf ( "   buf->data_limit=%d, state=%d, flags=%x, write_pos=%d, read_pos=%d\n",
+		buf->data_limit, buf->state, buf->flags.mask, buf->write_pos, buf->read_pos );
+
+	if ( (argc>2) && (lock.lksb.val[i].pid) && 
+		(lock.lksb.val[i].flags.bit.wake_request) ) {
+	    buf->state = MEMSTREAM_STATE_WRITER_DONE;
+	    status = SYS$WAKE ( &lock.lksb.val[i].pid, 0 );
+	    printf ( "   wake(%0X,0) status: %d\n", lock.lksb.val[i].pid,status);
+	}
     }
 
     return 1;

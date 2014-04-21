@@ -16,6 +16,20 @@
  *				Add min_bytes argument to dm_bypass_read.
  *
  * Revised:  17-APR-2014	Add expedite_flag to dm_bypass_read.
+ * Revised:  19-APR-2014	Support special popen(cmd,"r") operation, 
+ *				Reopen FILE pointer on null device and let
+ *				dmpipe read mailbox via QIO while checking
+ *				for no writers condition.
+ * Revised:  20-APR-2014	Overhaul stderr re-direction.  When stderr
+ *				would redirect to file, have stderr_propagate
+ *				create a mailbox, read via AST thread, that
+ *				children redirect stderr to.  When not a relay
+ *				mailbox, create dmpipe_stderr_xxxxxx logical
+ *				name in user so it is destroyed on image exit.
+ * Revised:  20-APR-2014	Do not attempt to bypass null device or output
+ *				mailbox when it matches DCL$OUTPUT_xxxxx device
+ *				created by DCL PIPE command.  This change and
+ *				previous allow dmpipe to work in batch mode.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -23,6 +37,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <unixio.h>
+#include <unixlib.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -36,12 +51,15 @@
 #include <lckdef.h>		/* VMS lock manager */
 #include <lib$routines.h>
 #include <jpidef.h>
+#include <lnmdef.h>		/* VMS logical names */
 #include <iodef.h>
 #include <dvidef.h>
 #include <devdef.h>		/* device characteristics */
 #include <dcdef.h>		/* VMS device class numbers */
 #include <secdef.h>		/* VMS global sections. */
 #include <vadef.h>		/* VMS virtual address space definitions */
+#include <agndef.h>
+#include <cmbdef.h>
 
 #define DMPIPE_ACE_ID 31814     /* ID code for application ACEs */
 #define DM_SECVER_MAJOR 1
@@ -54,7 +72,9 @@
  */
 static FILE *tty = 0;
 static char *tt_logical = "DBG$OUTPUT:";
-#define TTYPRINT if(!tty) tty=fopen(tt_logical,"w"); fprintf(tty,
+static char *action_name[5] = 
+   { "0-null", "1-connect", "2-accept", "3-accept+connect", "4-fail" };
+#define TTYPRINT if(!tty) tty=fopen(tt_logical,"a", "shr=put"); fprintf(tty,
 static char tty_name[256];
 struct dm_lksb_valblk_unit {
     pid_t pid;
@@ -144,6 +164,19 @@ struct dm_nexus {
     memstream rstream;		/* stream for reading */
     memstream wstream;		/* stream for writing */
     char name[DM_NEXUS_NAME_SIZE];	/* zero-terminated string */
+    /*
+     * Alternate read section. Make a special non-memory bypass for 
+     * popen(cmd,"r") that can provide proper EOF for input streams when
+     * spawned process dies.
+     */
+    struct {
+	unsigned short chan;   		/* move chan here */
+	unsigned short implied_lf;	/* add LF to buffer after reads. */
+	unsigned int buf_size;	/* Matches device buffer size */
+	unsigned int rpos, length;	/* position in buffer */
+	struct { unsigned short status, count; pid_t pid; } iosb;
+	char *buffer;
+    } alt;
 };
 
 /*
@@ -154,6 +187,7 @@ struct dm_bypass_ctx {
 
     struct dm_nexus *nexus;
 
+    int is_dcl_out;
     int used;
     char buffer[DM_BYPASS_BUFSIZE];	/* buffer for stdio operations */
 };
@@ -409,7 +443,113 @@ static int wait_for_peer ( struct dm_lock *lock, int timeout_sec )
     }
     return status;
 }
+/***************************************************************************/
+/* Handle reading of input mailbox from popen() in place of CRTL.  Use
+ * directional feature of mailbox to detect absence of writers to mailbox.
+ */
+static int alternate_read_bypass_init ( struct dm_nexus *nexus )
+{
+    int status;
+    static int nocrlf_index = -1;
 
+    static $DESCRIPTOR(devnam_dx,"");
+    /*
+     * Open directional channel on mailbox.
+     */
+    devnam_dx.dsc$a_pointer = nexus->name;
+    devnam_dx.dsc$w_length = strlen(nexus->name);
+    status = SYS$ASSIGN ( &devnam_dx, &nexus->alt.chan, 0, 0, AGN$M_READONLY );
+    if ( (status&1) == 0 ) return 0;	/* give up on error */
+    /*
+     * Allocate buffer with enough room to append carriage control.
+     */
+    nexus->alt.buf_size = nexus->dvi.bufsize + 2;
+    nexus->alt.length = 0;		/* length of current record */
+    nexus->alt.rpos = 0;		/* next read position */
+    nexus->alt.buffer = malloc ( nexus->alt.buf_size );
+    nexus->alt.iosb.status = 0;
+    if ( !nexus->alt.buffer ) {
+	SYS$DASSGN ( nexus->alt.chan );
+	return 0;
+    }
+    /*
+     * Set implied_lf flag according to POPEN_NO_CRLF_REC_ATTR feature.
+     */
+    nexus->alt.implied_lf = 1;
+    status = decc$feature_get ( "DECC$POPEN_NO_CRLF_REC_ATTR", 
+	__FEATURE_MODE_CURVAL );
+    if ( status == 1 ) nexus->alt.implied_lf = 0;
+    else if ( status < 0 ) perror ( "feature get in alt_bypass_init" );
+
+    /* if ( nexus->rstream ) nexus->rstream = 0;  FIX */
+    return 1;
+}
+
+static int alternate_bypass_read ( struct dm_nexus *nexus, void *buf_vp,
+	size_t nbytes, size_t min_bytes, int *expedite_flag )
+{
+    int count, status, seg, read_modifiers;
+    char *buffer;
+    /*
+     * Move bytes from alt.buffer until min_bytes moved or an exception
+     * such as EOF or no writers occurs.
+     */
+    buffer = buf_vp;
+    *expedite_flag = 0;
+    count = 0;
+    do {
+	seg = nexus->alt.length - nexus->alt.rpos;
+	if ( seg <= 0 ) {
+	    /*
+	     * Refill buffer, read from mailbox checking for no writers after
+	     * first read completes.
+	     */
+	    read_modifiers = nexus->alt.iosb.status ? IO$M_WRITERCHECK : 0;
+	    read_modifiers = IO$M_WRITERCHECK;
+	    status = SYS$QIOW ( EFN$C_ENF, nexus->alt.chan,
+		IO$_READVBLK | read_modifiers, &nexus->alt.iosb, 0, 0,
+		nexus->alt.buffer, nexus->alt.buf_size-2, 0, 0, 0, 0 );
+	    if ( (status&1) == 1 ) status = nexus->alt.iosb.status;
+	    /*
+	     * Reset rpos and length according to status of read.
+	     */
+	    nexus->alt.rpos = 0;
+	    if ( status&1 ) {
+		/* Success, append lf to end of buffer */
+		if ( nexus->alt.implied_lf ) {
+		    nexus->alt.buffer[nexus->alt.iosb.count] = '\n';
+		    nexus->alt.length++;
+		}
+		nexus->alt.length = nexus->alt.iosb.count;
+
+	    } else if ( status == SS$_NOWRITER ) {
+		nexus->alt.length = 0;
+		*expedite_flag = 1;	/* force loop exit */
+		if ( count == 0 ) {
+		    count = -1;
+		    errno = EPIPE;
+		}
+	    } else if ( status == SS$_ENDOFFILE ) {
+		/* Eat the EOF, but complete read short of min_bytes */
+		nexus->alt.length = 0;
+		*expedite_flag = 1;
+	    }
+
+	    seg = nexus->alt.length;
+	}
+	if ( seg > (nbytes-count) ) seg = nbytes-count;
+	/*
+	 * Add seg bytes from alt.buffer to caller's buffer and update pointers.
+	 */
+	if ( seg > 0 ) memcpy ( &buffer[count], 
+		&nexus->alt.buffer[nexus->alt.rpos], seg );
+	nexus->alt.rpos += seg;
+	count += seg;
+    } while ( (count < min_bytes) && (*expedite_flag == 0));
+
+    return count;
+}
+	
 /****************************************************************************/
 /* Manage dm_nexus list.
  *    find_nexus()		Find nexus block for device, creating new one
@@ -514,6 +654,10 @@ static int delete_nexus ( struct dm_nexus *nexus )
     }
     deassign_nexus_chan ( nexus );
 
+    if ( nexus->alt.buffer ) {
+	free ( nexus->alt.buffer );
+	nexus->alt.buffer = 0;
+    }
     return 0;
 }
 
@@ -567,7 +711,7 @@ static int get_device_chan_and_info ( int fd, char
 	void *buffer;
 	unsigned short *retlen;
     } item[] = {
-	{ 31, DVI$_DEVNAM, device_name, &devnam_len },
+	{ 31, DVI$_ALLDEVNAM, device_name, &devnam_len },
 	{ sizeof(info->devclass), DVI$_DEVCLASS, &info->devclass, 0 }, 
 	{ sizeof(info->devtype), DVI$_DEVTYPE, &info->devtype, 0 },
 	{ sizeof(info->devchar), DVI$_DEVCHAR, &info->devchar, 0 }, 
@@ -614,9 +758,9 @@ static int get_device_chan_and_info ( int fd, char
      * be the pipe driver used by DCL.
      */
 #ifdef DEBUG
-if ( !tty ) tty = fopen ( tt_logical, "w" );
-    fprintf (tty, "/bypass/ fd[%d] info: nam=%s, class=%d/%d, refcnt=%d/%x (%s)\n",
-	fd, device_name, info->devclass, info->devtype, info->refcnt,
+if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
+    fprintf (tty, "/bypass/ fd[%d] info: nam=%s, class=%d/%d, bfsz=%d, refcnt=%d/%x (%s)\n",
+	fd, device_name, info->devclass, info->devtype, info->bufsize, info->refcnt,
 	info->owner, getname(fileno(tty),tty_name) );
 #endif
 
@@ -626,9 +770,6 @@ if ( !tty ) tty = fopen ( tt_logical, "w" );
 	char *devnam;
 	for ( devnam = device_name; *devnam == '_'; devnam++ );
 	if ( strncmp ( devnam, "MPA", 3 ) == 0 ) {
-#ifdef DEBUG
-	    fprintf ( tty,"/bypass/ deeming %s a mailbox...\n", devnam );
-#endif
 	    info->devclass = DC$_MAILBOX;
 	    info->devtype = DT$_PIPE;
 	}
@@ -645,12 +786,12 @@ int dm_bypass_doprint_cb ( dm_bypass bp, void *buffer, int len )
 }
 /*
  * Initialize function gets properties on file to see if it eligible for bypass.
- * If not eligible, a null pointer is returned.  If it's elibible, a bypass
+ * If not eligible, a null pointer is returned.  If it's eligible, a bypass
  * handle (opaque pointer) is returned, though a bypass is not yet established.
  */
 dm_bypass dm_bypass_init ( int fd, int *flags )
 {
-    int status, code, devclass, devtype, devchar, proc_index;
+    int status, code, devclass, devtype, devchar, parent;
     dm_bypass bp;
     char device_name[DM_NEXUS_NAME_SIZE];
     unsigned short chan;
@@ -666,6 +807,10 @@ dm_bypass dm_bypass_init ( int fd, int *flags )
     if ( ((status&1) == 0) || (info.devclass != DC$_MAILBOX) ) {
 	if ( chan ) SYS$DASSGN ( chan );
 	return 0;
+    } else if ( info.devtype == DT$_NULL ) {
+	/* Null device has mailbox class but can't be used */
+	if ( chan ) SYS$DASSGN ( chan );
+	return 0;
     }
     /*
      * Allocate context and initialize.
@@ -674,7 +819,7 @@ dm_bypass dm_bypass_init ( int fd, int *flags )
     if ( !bp ) return 0;
     bp->related_fd = fd;
     /*
-     * Create existing nexus or create new one.  Remove redundant channel.
+     * Retrieve existing nexus or create new one.  Remove redundant channel.
      */
     bp->nexus = find_nexus ( device_name, &info, chan );
     if ( !bp->nexus ) {
@@ -685,8 +830,22 @@ dm_bypass dm_bypass_init ( int fd, int *flags )
     }
     bp->nexus->ref_count++;
     if ( chan != bp->nexus->chan ) SYS$DASSGN ( chan );
-    *flags = 1;			/* allow negotiation */
-
+    *flags = DM_BYPASS_HINT_STARTING;		/* allow negotiation */
+    /*
+     * Do special check for standard out fd (1) to see if stall should
+     * be disallowed.
+     */
+    if ( (fd == 1) && bp->nexus->parent ) {
+	char *dclout, logname[40], *a, *b;
+	sprintf ( logname, "DCL$OUTPUT_%08X", bp->nexus->parent );
+	dclout = getenv ( logname );
+	if ( dclout ) {
+	    /* Compare strings ignoring leading underscores */
+	    for ( a = dclout; *a == '_'; a++ );
+	    for ( b = bp->nexus->name; *b == '_'; b++ );
+	    if (strncmp ( a, b, strcspn ( a, ":" ) ) == 0) bp->is_dcl_out = 1;
+	}
+    }
     return bp;
 }
 static int begin_stream ( int flags, int is_writer, struct dm_nexus *nexus,
@@ -787,8 +946,8 @@ static int negotiate_bypass ( int flags, dm_bypass bp, const char *op,
 	action = 1;
     }
 #ifdef DEBUG
-    TTYPRINT "/bypass/ proc %x bypass negotiate action: %d, streams: %d %d\n",
-	my_val->pid, action, my_val->flags.bit.stream_id,
+    TTYPRINT "/bypass/ proc %x bypass negotiate action: %s, streams: %d %d\n",
+	my_val->pid, action_name[action], my_val->flags.bit.stream_id,
 	peer_val->flags.bit.stream_id );
 #endif
     /*
@@ -863,32 +1022,34 @@ static int negotiate_bypass ( int flags, dm_bypass bp, const char *op,
     return flags;
 }
 /*
- * Get name of current stderr file and put in logical name DMPIPE_STDERR_'pid'
- * Return value is VMS condition code.
+ * Get name of current stderr file and its device's device characteristics.
  */
-static char *stderr_filename ( char buffer[256] )
+static int stderr_filename ( struct dsc$descriptor_s *name_dx, int *devchar )
 {
-    char *rtl_errfile;
+    char *rtl_errfile, *buffer;
     int status;
-    unsigned short int length, equivlen;
+    unsigned short int length, equivlen, code;
     static char logname[40];
     static char equiv[256];
-    static $DESCRIPTOR(logname_dx,"");
+    static $DESCRIPTOR(logname_dx,"SYS$ERROR");
     static $DESCRIPTOR(logvalue_dx,equiv);
     /*
      * Get the name the CRTL is using and see if it matches SYS$ERROR,
      * returning getname() result to caller if not.
      */
-    rtl_errfile = getname(2,buffer);
+    *devchar = 0;
+    rtl_errfile = getname(2,name_dx->dsc$a_pointer);
     if ( !rtl_errfile ) return 0;
     length = strcspn ( rtl_errfile, ":.;" );
-    if ( (length!=9) || strncasecmp(rtl_errfile,"SYS$ERROR",9) )
-	return buffer;
+    if ( strncasecmp(rtl_errfile,"SYS$ERROR:",10) != 0 ) {
+	/* stderr NOT open on SYS$ERROR: */
+        name_dx->dsc$w_length = strlen ( rtl_errfile );
+	*devchar = DEV$M_REC | DEV$M_TRM;
+	return 1;
+    }
     /*
      * Translate sys$error since this logical isn't inherited by child.
      */
-    logname_dx.dsc$a_pointer = buffer;
-    logname_dx.dsc$w_length = length;
     logvalue_dx.dsc$w_length = sizeof(equiv)-1;
 
     status = LIB$GET_LOGICAL ( &logname_dx, &logvalue_dx, &equivlen );
@@ -896,74 +1057,156 @@ static char *stderr_filename ( char buffer[256] )
 fprintf(tty,"/bypass/ status of SYS$ERROR translate %d, l=%d, [0..4] = %x %x %x %d\n", 
 status,equivlen, (unsigned) equiv[0], (unsigned) equiv[1], (unsigned) equiv[2], (unsigned) equiv[3] );
 #endif
-    if ( (status&1) == 0 ) return buffer;
+    if ( (status&1) == 0 ) return status;
     equiv[equivlen] = 0;	/* terminate string */
     /*
-     * Strip process permanent file info. (do later).
+     * Strip process permanent file info and copy into caller's argument.
      */
+    buffer = name_dx->dsc$a_pointer;
     if ( (equiv[0] == 27) && (equiv[1] == 0) && (equivlen >= 4) ) {
 	strcpy ( buffer, &equiv[4] );
     } else {
        strcpy ( buffer, equiv );
     }
-    return buffer;
-}
+    name_dx->dsc$w_length = strlen ( buffer );
+    /*
+     * Get device characteristics;
+     */
+    code = DVI$_DEVCHAR;
+    status = LIB$GETDVI ( &code, 0, name_dx, devchar );
 
+    return status;
+}
+struct stderr_relay {
+    unsigned short int chan, active;
+    struct { unsigned short status, count; long pid; } iosb;
+
+    char buffer[512];
+    char cc[4];
+};
+static void stderr_relay_ast ( struct stderr_relay *relay )
+{
+    int status, length;
+    /*
+     * Check I/O completion status.
+     */
+    status = relay->iosb.status;
+    if ( status & 1 ) {
+	/* Normal completion, write received data to our stderr. */
+	length = relay->iosb.count;
+	relay->buffer[length++] = '\n';
+	relay->buffer[length] = '\0';
+
+	fprintf ( stderr, "%s", relay->buffer );
+    } else if ( status == SS$_ENDOFFILE ) {
+	/* Force flush */
+    }
+    /*
+     * Read next record.
+     */
+    status = SYS$QIO ( EFN$C_ENF, relay->chan, IO$_READVBLK, &relay->iosb,
+	    stderr_relay_ast, relay, 
+	    relay->buffer, sizeof(relay->buffer), 0, 0, 0, 0 );
+    if ( (status&1) == 0 ) relay->active = 0;
+
+    return;
+}
+/*
+ * Create DMPIPE_STDERR_xxxxxxxx logical name with stderr file children
+ * of process xxxxxxxx are to use for their stderr file (rather than stdout).
+ */
 int dm_bypass_stderr_propagate ( void )
 {
-    int code, status, proc_index;
+    int devchar, status, proc_index, code;
     pid_t self;
     static char logname[40];
     static char errfile[256];
     static $DESCRIPTOR(logname_dx,logname);
     static $DESCRIPTOR(logvalue_dx,errfile);
+    static $DESCRIPTOR(table_dx,"LNM$PROCESS");
+    static struct stderr_relay relay = { 0, 0, { 0, 0, 0 } };
+
+    struct {
+	short int buflen, code;
+	void *bufaddr;
+	short int *retlen;
+    } item[3];
 #ifdef DEBUG
-    if ( !tty ) tty = fopen ( tt_logical, "w" );
+    if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 #endif
+    /*
+     * Use side effect of $GETJPI() to get our PID.
+     */
     code = JPI$_PROC_INDEX;
     self = 0;
     status = LIB$GETJPI ( &code, &self, 0, &proc_index, 0, 0 );
-    if ( status & 1 ) {
-	/*
-	 * Construct logical name and get current stderr filename as
-	 * equivalence name.
-	 */
-	sprintf ( logname, "DMPIPE_STDERR_%08X", self );
-	logname_dx.dsc$w_length = strlen ( logname );
+    if ( (status&1) == 0 ) {
+	if (tty) fprintf ( tty, "/bypass/ getjpi error in propagate(): %d\n", status );
+	return status;
+    }
+    /*
+     * Construct logical name and get current stderr filename as
+     * equivalence name.
+     */
+    sprintf ( logname, "DMPIPE_STDERR_%08X", self );
+    logname_dx.dsc$w_length = strlen ( logname );
 
-	logvalue_dx.dsc$a_pointer = stderr_filename ( errfile );
-	if ( !logvalue_dx.dsc$a_pointer ) return SS$_ABORT;
-
-	logvalue_dx.dsc$w_length = strlen ( logvalue_dx.dsc$a_pointer );
-	if ( logvalue_dx.dsc$w_length == 0 ) return SS$_ABORT;
+    status = stderr_filename ( &logvalue_dx, &devchar );
+    if ( (status&1) == 0 ) {
+#ifdef DEBUG
+	fprintf(tty,"/bypass/ stderr_filename call failed: %d\n", status );
+#endif
+	return status;
+    }
+    /*
+     * If parent's stderr is record oriented, assume it is a shareable
+     * device child processes can write to directly.
+     */
+    if ( devchar & DEV$M_REC ) {
 	/*
-	 * Create logical name that will be inherited by child.
+	 * Create user mode logical name in process table.
 	 */
-	status = LIB$SET_LOGICAL ( &logname_dx, &logvalue_dx, 0, 0, 0 );
+	item[0].buflen = logvalue_dx.dsc$w_length;
+	item[0].code = LNM$_STRING;
+	item[0].bufaddr = logvalue_dx.dsc$a_pointer;
+	item[0].retlen = 0;
+	item[1].buflen = item[1].code = 0;
+
+	status = SYS$CRELNM ( 0, &table_dx, &logname_dx, 0, item );
 #ifdef DEBUG
 	fprintf (tty, "/bypass/ fd[stderr] set logical %s status: %d (%s)\n",
 		logname, status, errfile );
 #endif
-	if ( (status&1) == 0 ) return status;
-	/*
-	 * Force stderr to shared access.  Using empty string reuses old name.
-	 */
-	stderr = freopen ( getname(2,errfile), "a+", stderr, "shr=put,upi" ); 
-#ifdef DEBUG
-	fprintf(tty, "/bypass/ parent freopen result: %x\n", stderr );
-    } else {
-	fprintf ( tty, "/bypass/ getjpi error in propagate(): %d\n", status );
-#endif
+	return status;
     }
+    /*
+     * Parent's stderr is a file.  Create mailbox children will use and
+     * relay to stderr in AST thread.  dmpipe_stderr_xxx logical will
+     * be mailbox's logical name.
+     */
+    if ( relay.active ) return status;
+
+    status = SYS$CREMBX ( 0, &relay.chan, 
+	sizeof(relay.buffer), sizeof(relay.buffer)*2, 0x0ff0, 0, &logname_dx,
+	CMB$M_READONLY );
+    if ( (status&1) == 1 ) {
+	relay.active = 1;
+	status = SYS$QIO ( EFN$C_ENF, relay.chan, IO$_READVBLK, &relay.iosb,
+	    stderr_relay_ast, &relay, 
+	    relay.buffer, sizeof(relay.buffer), 0, 0, 0, 0 );
+	if ( (status&1) == 0 ) relay.active = 0;
+    }
+    
     return status;
 }
 
-int dm_bypass_stderr_recover ( pid_t parent )
+int dm_bypass_stderr_recover ( pid_t parent, dm_bypass out_bp )
 {
     static char logname[40];
     static char errfile[256];
     static $DESCRIPTOR(logname_dx,logname);
     static $DESCRIPTOR(logvalue_dx,errfile);
+    static $DESCRIPTOR(table_dx,"LNM$FILE_DEV");
     static int recovered = 0;
     int status;
     short int length, length2;
@@ -974,7 +1217,7 @@ int dm_bypass_stderr_recover ( pid_t parent )
      * Construct logical name.
      */
 #ifdef DEBUG
-    if ( !tty ) tty = fopen ( tt_logical, "w" );
+    if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 #endif
     sprintf ( logname, "DMPIPE_STDERR_%08X", parent );
     logname_dx.dsc$w_length = strlen ( logname );
@@ -982,22 +1225,31 @@ int dm_bypass_stderr_recover ( pid_t parent )
     /*
      * See if parent used popen.  Should really only check process table.
      */
-    status = LIB$GET_LOGICAL ( &logname_dx, &logvalue_dx, &length );
+    status = LIB$GET_LOGICAL(&logname_dx, &logvalue_dx, &length, &table_dx);
     if ( status & 1 ) {
 	/*
-         * Reopen stderr.
+         * Parent specified device/file we are to use to our stderr.  check
+         * for current output.
 	 */
-	char old_errfile[256], tmp[256];
+	char old_errfile[256], tmp[256], *dclout;
 	int i;
 	for ( i = 0; i < length; i++ ) 
 	    if ( !isprint(errfile[i]) ) tmp[i] = '.'; else tmp[i]=errfile[i];
 	tmp[i] = 0;
+	sprintf ( logname, "DCL$OUTPUT_%08X", parent );
+    	logname_dx.dsc$w_length = strlen ( logname );
+	dclout = getenv ( logname );
 #ifdef DEBUG
-	fprintf(tty, "/bypass/ stderr of parent: '%s'\n", tmp );
+	fprintf(tty, "/bypass/ stderr of parent: '%s', stdout_name: '%s'/'%s'\n", 
+	tmp, out_bp->nexus->name, dclout ? dclout : "<none>" );
 #endif
 
 	errfile[length] = '\0';
-	stderr = freopen ( errfile, "a+", stderr, "shr=upi,put" );
+	stderr = freopen ( errfile, "w", stderr, "shr=upi,put" );
+	/* Leave old stderr dangling, but closing with freopen messes up DCL
+	 * reading pipe output.
+	 */
+	/* stderr = fopen ( errfile, "a+", "shr=put,upi" ); */
 	if ( !stderr ) {
 #ifdef DEBUG
 	fprintf(tty,"/bypass/ freopen error: %d/%d = '%s'\n", errno, vaxc$errno,
@@ -1036,10 +1288,13 @@ int dm_bypass_startup_stall ( int initial_flags, dm_bypass bp, char *op,
     /*
      * Bail out if we've stopped negotiating and cleared bit 0 in flags.
      */
-    flags = initial_flags;
+    flags = initial_flags & 255;
     if ( (flags & 1) == 0 ) return flags;	/* negotiation over */
     if ( (flags & 2) && (*op == 'r') ) return flags;
     if ( (flags & 4) && (*op == 'w') ) return flags;
+    if ( bp->is_dcl_out ) {
+	return 0;			/* stdout being read by DCL */
+    }
     /*
      * If we already have the corresponding stream, we are done.
      */
@@ -1063,9 +1318,9 @@ int dm_bypass_startup_stall ( int initial_flags, dm_bypass bp, char *op,
      * Method of stall varies with device type.
      */
 #ifdef DEBUG
-if ( !tty ) tty = fopen ( tt_logical, "w" );
-   fprintf (tty, "/bypass/ %x-fd[%d] STARTUP_STALL, initial op '%s'\n",
-		bp->nexus->self, bp->related_fd, op  );
+if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
+   fprintf (tty, "/bypass/ %x-fd[%d] STARTUP_STALL, initial op '%s' dclout=%d (bfsz=%d)\n",
+		bp->nexus->self, bp->related_fd, op, bp->is_dcl_out, nexus->dvi.bufsize  );
 #endif
     if ( (nexus->dtype == DT$_MBX) || (nexus->dtype== DT$_PIPE) ) {
 	/*
@@ -1119,9 +1374,10 @@ if ( !tty ) tty = fopen ( tt_logical, "w" );
 	    }
 	}
 #ifdef DEBUG
-fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx attn: %d\n",
+fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx attn: %d (%d)\n",
 		bp->nexus->self, bp->related_fd, status,
-		nexus->mbx_watch.is_blocking_lock, nexus->mbx_watch.mailbox_active );
+		nexus->mbx_watch.is_blocking_lock, 
+		nexus->mbx_watch.mailbox_active, nexus->dvi.bufsize );
 #endif
 	/*
 	 * Wait done, cleanup.  Kill pending attention/timer AST.
@@ -1148,12 +1404,21 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 	    deassign_nexus_chan ( nexus );
 	} else {
 	    /*
-	     * No conflicting locks seen, give up.
+	     * No conflicting locks seen, give up on memory bypass.
 	     */
 	    my_val->flags.bit.shutdown = 1;
 	    status = sys_enq ( LCK$K_CRMODE, &bp->nexus->lock, LCK$M_NOQUEUE,
 		0, 0 );
 	    flags = (flags&0x7ffe);
+	    /*
+	     * Check for alternate bypass mode in which we take over
+	     * reads of mailbox to detect no-writers condition.
+	     */
+	    if ( initial_flags&DM_BYPASS_HINT_POPEN_R ) {
+		status = alternate_read_bypass_init ( nexus );
+		if ( status&1 ) 
+		   flags |= (DM_BYPASS_HINT_READS|DM_BYPASS_HINT_POPEN_R);
+	    }
 	    deassign_nexus_chan ( nexus );
 	}
     } else {
@@ -1191,8 +1456,16 @@ int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes,
 	size_t min_bytes, int *expedite_flag )
 {
     int doesnt_care;
-    return memstream_read ( bp->nexus->rstream, buffer, nbytes, min_bytes,
-	expedite_flag ? expedite_flag : &doesnt_care );
+    if ( bp->nexus->rstream ) {
+	return memstream_read ( bp->nexus->rstream, buffer, nbytes, min_bytes,
+		expedite_flag ? expedite_flag : &doesnt_care );
+    }
+    if ( bp->nexus->alt.buffer ) {
+	/* Read directly from mailbox, but check for no writers */
+	return alternate_bypass_read ( bp->nexus, buffer, nbytes, min_bytes, 
+		expedite_flag ? expedite_flag : &doesnt_care );
+    }
+    return -1;
 }
 int dm_bypass_write ( dm_bypass bp, const void *buffer, size_t nbytes )
 {

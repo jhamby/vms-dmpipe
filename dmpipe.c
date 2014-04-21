@@ -25,7 +25,12 @@
  * Revised: 7-APR-2014			Add dm_perror() function.
  * Revised:15-APR-2014			Add support for stderr propagation.
  * Revised:16-APR-2014			Incoporate change to dm_bypass_read.
- * Revised:17-APR-2014			Support expedite flag (flush).
+ * Revised: 17-APR-2014			Support expedite flag (flush).
+ * Revised: 19-APR-2014			Support flush all in fflsuh.
+ * Revised: 19-APR-2014			Support DM_BYPASS_HINT_POPEN_R flag,
+ *					which keeps popen(cmd,"r") from
+ *					hanging.
+ * Revised: 20-APR-2014			Fix bug in dm_fgetc.
  */
 #include <stdlib.h>
 #include <stdarg.h>
@@ -121,6 +126,7 @@ static struct {
  *     find_fp_extension
  *     rundown_extension
  */
+static struct dm_fd_extension *find_fp_extension(FILE *fp, int ini_if);
 static void init_extension ( struct dm_fd_extension *fdx, int fd, FILE *fp )
 {
     char nambuf[512];
@@ -137,18 +143,26 @@ static void init_extension ( struct dm_fd_extension *fdx, int fd, FILE *fp )
     if ( fd == 2 ) {
 	/*
 	 * If we are a child process (have parent) created by popen(), redirect
-	 * stderr from the pipe (stdour) to the parent's rather than our stdour.
+	 * stderr from the pipe (stdout) to the parent's rather than our stdour.
          */
 	pid_t parent;
+	struct dm_fd_extension *ofdx;
 	parent = getppid ( );
-	if ( parent ) dm_bypass_stderr_recover ( parent );
+	if ( parent ) {
+	    /* Initialize stdout if we haven't done so yet so we can
+	       * retrieve the output device */
+	    ofdx = find_fp_extension ( stdout, 1 );
+	    if ( ofdx && ofdx->initialized && ofdx->bp ) {
+	        dm_bypass_stderr_recover ( parent, ofdx->bp );
+	    }
+	}
     }
     /*
      * Determine if device used by FP capable of being bypassed.
      */
     fdx->bp = dm_bypass_init ( fd, &fdx->bypass_flags );
 #ifdef DEBUG
-if ( !tty ) tty = fopen ( "TT:", "w" );
+if ( !tty ) tty = fopen ( "DBG$OUTPUT:", "a", "shr=put" );
     fprintf (tty, "/dmpipe/ init extension for file[%d] (%s), fp=%x, flags=%d\n", 
 	fd, getname(fd,nambuf), fp, fdx->bypass_flags);
 #endif
@@ -304,6 +318,13 @@ ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
 	    int count;
 	    count = dm_bypass_read ( fdx->bp, buffer_vp, nbytes, nbytes, 0 );
 	    if ( count < 0 ) return -1;
+	    if ((count == 0) && (fdx->bypass_flags&DM_BYPASS_HINT_POPEN_R)) {
+	        /*
+	         * See dm_fread for explanation of freopen().
+	         */
+	        if ( fdx->fp ) fdx->fp = freopen ( "_NL:", "r", fdx->fp );
+	        fdx->bypass_flags ^= DM_BYPASS_HINT_POPEN_R;
+	    }
 	    return count;
 	}
     }
@@ -388,7 +409,7 @@ int dm_open ( const char *file_spec, int flags, ... )
 	args[1].vp = (void *) file_spec;
 	args[2].ul = flags;
 	args[3].vp = arg3_vp;
-	for ( i = 4; 4 <= count; i++ ) args[i].vp = va_arg(ap, void *);
+	for ( i = 4; i <= count; i++ ) args[i].vp = va_arg(ap, void *);
 
 	fd = LIB$CALLG ( args, open );
 	free ( args );
@@ -471,18 +492,51 @@ FILE *dm_popen ( const char *command, const char *type )
     if ( fp ) {
         fdx = find_fp_extension ( fp, 0 );
 	if ( fdx && !fdx->initialized ) {
+	    /*
+	     * Init extension and set hints flag if we were open for read.
+	     */
 	    init_extension ( fdx, fileno(fp), fp );
+	    if ((fdx->bypass_flags&DM_BYPASS_HINT_STARTING) && (*type == 'r'))
+		fdx->bypass_flags |= DM_BYPASS_HINT_POPEN_R;
 	}
     }
     return fp;
 }
 FILE *dm_fopen ( const char *file_spec, const char *a_mode, ... )
 {
-    int status;
+    int status, count, i;
     struct dm_fd_extension *fdx;
     FILE *fp;
+    va_list ap;
+    /*
+     * Support standard open arguments and DEC extension.  VMS doesn't
+     * map first page of address space, so value < 512 is assumed to be
+     * a bit mask (mode).
+     */
+    va_count(count);	/* argument count */
 
-    fp = fopen ( file_spec, a_mode );
+    if ( count < 3 ) {
+	fp = fopen ( file_spec, a_mode );
+    } else {
+	/*
+	 * Copy the argument list.
+	 */
+	union arglist{ void *vp; unsigned long ul; } *args;
+
+	args = calloc ( count+1, sizeof(union arglist) );
+	va_start(ap,a_mode);
+	args[0].ul = count;
+	args[1].vp = (void *) file_spec;
+	args[2].vp = (void *) a_mode;
+	for ( i = 3; i <= count; i++ ) args[i].vp = va_arg(ap, void *);
+
+	fp = (FILE *) LIB$CALLG ( args, fopen );
+	free ( args );
+        va_end(ap);
+    }
+    /*
+     * Check for extension.
+     */
     if ( fp ) {
         fdx = find_fp_extension ( fp, 0 );
 	if ( fdx && !fdx->initialized ) {
@@ -501,14 +555,33 @@ size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr )
 	if ( fdx->read_ops == 0 ) {
 	    /* First time reading, stall for writer to give peer a chance
 	     * to negotiate bypass */
-	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+	    status = dm_bypass_startup_stall (fdx->bypass_flags,
 		fdx->bp, "r", fdx->fcntl_flags );
+#ifdef DEBUG
+fprintf(tty, "/dmpipe/ fd[%d] fread startup stall flags: %d -> %d\n", 
+fdx->fd, fdx->bypass_flags, status);
+#endif
+	    fdx->bypass_flags = status;
 	}
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
+	    /*
+	     * Bypass the CRTL and read via share memory pipe (or other means).
+	     */
 	    int count;
 	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems, itmsize,0 );
 	    if ( count < 0 ) return 0;
+	    /*
+	     * After first EOF (count==0), check for special POPEN_R case and
+	     * repoen file on null device, deassiging the bidirectional
+	     * channel on the mailbox.  This lets the bypass module detect
+	     * when mailbox has no writers.  We can't do this before the EOF
+	     * because freopen drains the mailbox before closing the channel.
+	     */
+	    if ((count == 0) && (fdx->bypass_flags&DM_BYPASS_HINT_POPEN_R)) {
+		fdx->fp = freopen ( "_NL:", "r", fptr );
+		fdx->bypass_flags ^= DM_BYPASS_HINT_POPEN_R;
+	    }
 	    return count /itmsize;
 	}
     }
@@ -585,6 +658,13 @@ static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
 		DM_INBUF_BUFSIZE-inbuf->length, (inbuf_min_delay_control==1) ?
 		needed : (DM_INBUF_BUFSIZE-inbuf->length), &expedite_flag );
 	if ( count < 0 ) return -1;
+	if ((count == 0) && (fdx->bypass_flags&DM_BYPASS_HINT_POPEN_R)) {
+	    /*
+	     * See dm_fread for explanation of freopen().
+	     */
+	    fdx->fp = freopen ( "_NL:", "r", fdx->fp );
+	    fdx->bypass_flags ^= DM_BYPASS_HINT_POPEN_R;
+	}
 	inbuf->length += count;
         available = inbuf->length - inbuf->rpos;
 	/*
@@ -606,8 +686,13 @@ char *dm_fgets ( char *str, int maxchar, FILE *fptr )
 	if ( fdx->read_ops == 0 ) {
 	    /* First time reading, stall for writer to give peer a chance
 	     * to negotiate bypass */
-	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+	    i = dm_bypass_startup_stall (fdx->bypass_flags,
 		fdx->bp, "r", fdx->fcntl_flags );
+#ifdef DEBUG
+fprintf(tty, "/dmpipe/ fd[%d] fgets startup stall result flags: %d->%d\n", 
+fdx->fd, fdx->bypass_flags, i );
+#endif
+	    fdx->bypass_flags = i;
 	}
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
@@ -689,11 +774,11 @@ int dm_fgetc ( FILE *fptr )
 	}
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
-	    unsigned char *ucp;
+	    unsigned char ucp;
 	    if ( 0 == load_inbuf ( fdx, 1 ) ) {
-	        ucp = (unsigned char *) fdx->inbuf->rpos;
+	        ucp = (unsigned char) fdx->inbuf->buffer[fdx->inbuf->rpos];
 		fdx->inbuf->rpos++;
-		return *ucp;
+		return ucp;
 	    } else return -1;   /* callers set errno? */
 	}
     }
@@ -721,6 +806,36 @@ int dm_pclose ( FILE *fptr )
 	rundown_extension ( fdx );
     }
     return pclose ( fptr );
+}
+/*
+ * dmpipe version of isapipe includes additional information abount
+ * status of pipe bypass.  Second argument is optional, specify null
+ * pointer to omit.
+ */
+int dm_isapipe ( int fd, int *bypass_status )
+{
+    int status;
+    struct dm_fd_extension *fdx;
+
+    fdx = find_extension ( fd, 1 );
+    if ( fdx && fdx->initialized && fdx->bp ) {
+	/*
+	 * Bypass structure was allocated, so we are a pipe and capable of 
+	 * using shared memory bypass.  Return flags if argumnent supplied
+	 * by caller.
+         */
+	if ( bypass_status ) {
+	    *bypass_status = fdx->bypass_flags;
+	    if ( fdx->bypass_flags & (DM_BYPASS_HINT_STARTING|
+		DM_BYPASS_HINT_READS|DM_BYPASS_HINT_WRITES) ) return 2;
+	}
+	return 1;
+    }
+    /*
+     * Invalid fd or device not a mailbox, let CRTL handle it.
+     */
+    if ( bypass_status ) *bypass_status = 0;
+    return isapipe ( fd );
 }
 /*
  * Return I/O counts so applications can verify bypass is working.
@@ -754,7 +869,7 @@ static int unistd_partial_cb ( void *fdx_vp, char *buffer, int length )
 	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
 		fdx->bp, "w", fdx->fcntl_flags );
 #ifdef DEBUG
-if ( !tty ) tty = fopen ( "TT:", "w" );
+if ( !tty ) tty = fopen ( "DBG$OUTPUT:", "a", "shr=put" );
 fprintf (tty, "/dmpipe/ FD[%d] partial(,,%d) startup set bypass_flags: %d\n", 
 		 fdx->fd, length, fdx->bypass_flags );
 #endif
@@ -1615,7 +1730,6 @@ int dm_fsync ( int fd )
     fdx = find_extension ( fd, 0 );
     if ( fdx && fdx->initialized &&
 	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
-	memstream rstream, wstream;
 
 	return flush_extension ( fdx );
     }
@@ -1628,7 +1742,36 @@ int dm_fsync ( int fd )
 int dm_fflush ( FILE *fptr )
 {
     struct dm_fd_extension *fdx;
-
+    /*
+     * Check for flush-all case of fptr null
+     */
+    if ( !fptr ) {
+	int row, col;
+	struct dm_fd_extension *extrow;
+	/*
+	 * Scan fdx table for initialized extensions and recursivelflush.
+	 */
+	for ( row = 0; row < FD_EXTENSION_MAP_ROWS; row++ ) {
+	    /*
+	     * Rows are dynamically allocated, skip if never created.
+	     */
+	    extrow = dm_fd_extrow[row];
+	    if ( !extrow ) continue;
+	    /*
+	     * Scan row looking for active (initialized) extensions with fp 
+	     * that we have written to at least once and flush.
+	     */
+	    for ( col = 0; col < FD_EXTENSION_MAP_COLS; col++ ) {
+		fdx = &extrow[col];
+		if ( fdx->initialized && fdx->fp && (fdx->write_ops>0) ) {
+		    dm_fflush ( fdx->fp );
+		}
+	    }
+	}
+    }
+    /*
+     * Flush single stream.
+     */
     fdx = find_fp_extension ( fptr, 0 );
     if ( fdx && fdx->initialized &&
 	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {

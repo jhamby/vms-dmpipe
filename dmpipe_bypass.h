@@ -10,6 +10,7 @@
 #define DM_BYPASS_HINT_STARTING 1
 #define DM_BYPASS_HINT_READS 2
 #define DM_BYPASS_HINT_WRITES 4
+#define DM_BYPASS_HINT_POPEN_R 256
 typedef struct dm_bypass_ctx *dm_bypass;   /* opaque type */
 /*
  * Initialize returns a context and sets flags.
@@ -38,7 +39,7 @@ int dm_bypass_write ( dm_bypass bp, const void *buffer, size_t nbytes );
  * rather than stdout.
  */
 int dm_bypass_stderr_propagate(void);
-int dm_bypass_stderr_recover(pid_t parent);
+int dm_bypass_stderr_recover(pid_t parent, dm_bypass stdout_bp);
 /*
  * Give direct access to memstream for polling.  A file open read/write
  * can have 2 streams.
