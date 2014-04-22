@@ -95,11 +95,10 @@ int main ( int argc, char **argv )
      * Initialize RTL timer routines and select file it is to use.
      */
     mode = 0;
-    if ( isatty ( 1 ) ) tt = stdout;
-    else {
+    if ( isatty ( 1 ) ) {
 	tt = fopen ( "TT:", "w" );
 	if ( !tt ) tt = stdout;
-    }
+    } else tt = stdout;
 
     LIB$INIT_TIMER(&timer_data);
     /*
