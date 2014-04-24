@@ -78,7 +78,7 @@ static int timer_report ( struct dsc$descriptor_s *line_dx, FILE *fp )
 	memmove ( &line[8], &line[9], line_len-8 );
 	line_len--;
     }
-    fprintf ( fp, "(%s)\n", line );
+    fprintf ( fp, "(%c%c%s)\n", isapipe(0)?'Y':'N', isapipe(1)?'y':'n', line );
     free ( line );
 
     return 1;
@@ -95,7 +95,7 @@ int main ( int argc, char **argv )
      * Initialize RTL timer routines and select file it is to use.
      */
     mode = 0;
-    if ( isatty ( 1 ) ) {
+    if ( !isatty ( 1 ) ) {
 	tt = fopen ( "TT:", "w" );
 	if ( !tt ) tt = stdout;
     } else tt = stdout;

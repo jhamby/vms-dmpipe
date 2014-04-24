@@ -1,4 +1,4 @@
-								21-APR-2014
+								23-APR-2014
 
 DMPIPE is a libary of functions to optimize pipe-based communication between
 C-based programs.  When the programs on both sides (writer and reader) of
@@ -85,13 +85,24 @@ Build files:
     descrip.mms		MMS description file to compile and link demonstration
 			programs.  Two forms of each program are made:
                             hmac.exe,case_munge.exe        DMPIPE enabled.
-			    hmace-0.exe,case_munge-o.exe   Not DMPIPE enhanced.
+			    hmace_0.exe,case_munge_o.exe   Not DMPIPE enhanced.
+
+    make_dmpipeshr.com  Command procedure to make dmpipeshr.exe shareable
+			image.  Transfer vector has both uppercase only and
+			lower case symbol names.  Shareable image uses private
+			doprint engine and decc$share. When building specify
+			/macro=share=1 to create the shareable image and
+			link the demontration programs against it.
 
     dmpipe.opt		Must be used to link DMPIPE-enabled programs.  In
 			order to access the doprint engine for printf 
 			processing (e.g. decc$$gxdopring()), programs are
 			linked against startlet.olb object library rather 
 			than decc$shr.exe.
+
+    dmpipeshr.opt	Use this option file instead of dmpipe.opt to link
+			DMPIPE-enabled programs against shareable image
+			dmpipe_exe:dmpipeshr.exe and sys$share:decc$shr.exe.
 
     dmpipe_private_doprint.opt
 			Use this option file instead of dmpipe.opt to link

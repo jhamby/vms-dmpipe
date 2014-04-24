@@ -1,2 +1,2 @@
-hmac.obj
+dmpipe_lib:hmac.obj
 sys$share:ssl$libcrypto_shr32.exe/share

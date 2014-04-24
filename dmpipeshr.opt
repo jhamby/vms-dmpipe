@@ -1,0 +1,4 @@
+!
+! Linker options file for linking programs against dmpipeshr shareable image.
+!
+dmpipe_exe:dmpipeshr.exe/share

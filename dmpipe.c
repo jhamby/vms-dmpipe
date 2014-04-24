@@ -464,7 +464,7 @@ int dm_dup2 ( int file_desc1, int file_desc2 )
     return fd;
 }
 
-FILE *dm_fdopen ( int file_desc, char *a_mode )
+FILE *dm_fdopen ( int file_desc, const char *a_mode )
 {
     int status;
     struct dm_fd_extension *fdx;

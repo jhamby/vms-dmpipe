@@ -27,7 +27,7 @@ int dm_open ( const char *file_spec, int flats, ... );
 int dm_dup ( int file_desc );
 int dm_dup2 ( int file_desc1, int file_desc2 );
 
-FILE *dm_fdopen ( int file_desc, char *a_mode );
+FILE *dm_fdopen ( int file_desc, const char *a_mode );
 FILE *dm_popen ( const char *command, const char *type );
 FILE *dm_fopen ( const char *file_spec, const char *a_mode, ... );
 size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr );

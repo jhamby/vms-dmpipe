@@ -1,7 +1,7 @@
-doprint.obj
-doprint_flt_gx.obj
-doprint_flt_dx.obj
-doprint_flt_tx.obj
-doprint_flt_g.obj
-doprint_flt_d.obj
-doprint_flt_t.obj
+dmpipe_lib:doprint.obj
+  doprint_flt_gx.obj
+  doprint_flt_dx.obj
+  doprint_flt_tx.obj
+  doprint_flt_g.obj
+  doprint_flt_d.obj
+  doprint_flt_t.obj
