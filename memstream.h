@@ -59,4 +59,6 @@ int memstream_close ( memstream stream );
 int memstream_destroy ( memstream stream );
 
 int memstream_flush ( memstream stream );
+
+int is_memstream_peer_done(memstream stream, int is_writer);
 #endif

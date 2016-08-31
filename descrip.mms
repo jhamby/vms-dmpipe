@@ -92,6 +92,10 @@ doscan_objs = $(odir)doscan.obj $(odir)doscan_flt_gx.obj -
 lib_objs = $(dmpipe_obj) $(odir)dmpipe_bypass.obj $(odir)memstream.obj -
 	$(odir)dmpipe_poll.obj $(doscan_objs) $(doprint_objs)
 
+.IFDEF SHARE
+lib_objs = $(odir)dmpipe_libinit.obj $(lib_objs)
+.ENDIF
+
 all : $(images)
    @ write sys$output "Images built"
 
@@ -127,26 +131,29 @@ $(doprint_opt_file) : $(dmpipe_obj) $(odir)dmpipe_bypass.obj -
 ! Object file rules
 !
 $(dmpipe_obj) : dmpipe.h dmpipe.c dmpipe_bypass.h descrip.mms
-   CC $(CFLAGS) dmpipe.c $(dmpipe_cc_quals)
+   CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) dmpipe.c $(dmpipe_cc_quals)
+
+$(odir)dmpipe_libinit.obj : dmpipe.h dmpipe_libinit.c
+   CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) dmpipe_libinit.c $(dmpipe_cc_quals)
 
 $(odir)dmpipe_bypass.obj : dmpipe_bypass.c dmpipe_bypass.h memstream.h
-   CC $(CFLAGS) dmpipe_bypass.c
+   CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) dmpipe_bypass.c
 
 !
 ! User applications should only need to include dmpipe.h
 ! the '_0' version is compiled without enable_bypass.
 !
 $(odir)hmac.obj : hmac.c dmpipe.h dmpipe_main.c
-   CC $(CFLAGS) hmac.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
+   CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) hmac.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
 
 $(odir)case_munge.obj : case_munge.c dmpipe.h dmpipe_main.c
-  CC $(CFLAGS) case_munge.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) case_munge.c  /define=(ENABLE_BYPASS,DM_WRAP_MAIN)
 
 $(odir)test_poll.obj : test_poll.c dmpipe.h
-   CC $(CFLAGS) test_poll.c
+   CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) test_poll.c
 
 $(odir)pipe_torture.obj : pipe_torture.c dmpipe.h dmpipe_main.c
-  CC $(CFLAGS) pipe_torture.c
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) pipe_torture.c
 
 $(odir)test_poll_0.obj : test_poll.c dmpipe.h
    CC $(CFLAGS) test_poll.c/object=$(odir)test_poll_0.obj/define=DM_NO_CRTL_WRAP
@@ -158,39 +165,39 @@ $(odir)hmac_0.obj : hmac.c
    CC $(CFLAGS) hmac.c  /object=$(odir)hmac_0.obj
   
 $(odir)memstream.obj : memstream.c memstream.h
-  CC $(CFLAGS) memstream.c
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) memstream.c
 
 $(odir)dmpipe_poll.obj : dmpipe_poll.c dmpipe_poll.h dmpipe_bypass.h
-  CC $(CFLAGS) dmpipe_poll.c
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) dmpipe_poll.c
 
 !
 ! Modules for private doscan engine for use when fscanf function with pipes.
 !
 $(odir)doscan.obj : doscan.c doscan.h
-  CC $(CFLAGS) doscan.c
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) doscan.c
 
 $(odir)doscan_flt_gx.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=G/l_double_size=128/list/show=exp
 
 $(odir)doscan_flt_g.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=G/l_double_size=64/list/show=exp
 
 $(odir)doscan_flt_dx.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=D/l_double_size=128/list/show=exp
 
 $(odir)doscan_flt_d.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=D/l_double_size=64/list/show=exp
 
 $(odir)doscan_flt_tx.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=IEEE/l_double_size=128/list/show=exp
 
 $(odir)doscan_flt_t.obj : doscan_flt_all.c doscan.h
-  CC $(CFLAG) doscan_flt_all.c -
+  CC $(CFLAGS) doscan_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=IEEE/l_double_size=64/list/show=exp
 
 !
@@ -198,30 +205,30 @@ $(odir)doscan_flt_t.obj : doscan_flt_all.c doscan.h
 ! decc$shr shareable image rather than starlat of decc$rtl object library.
 !
 $(odir)doprint.obj : doprint.c doprint.h
-  CC $(CFLAGS) doprint.c
+  CC/OBJECT=$(MMS$TARGET_NAME) $(CFLAGS) doprint.c
 
 $(odir)doprint_flt_gx.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=G/l_double_size=128/list/show=exp
 
 $(odir)doprint_flt_g.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=G/l_double_size=64/list/show=exp
 
 $(odir)doprint_flt_dx.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=D/l_double_size=128/list/show=exp
 
 $(odir)doprint_flt_d.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=D/l_double_size=64/list/show=exp
 
 $(odir)doprint_flt_tx.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=IEEE/l_double_size=128/list/show=exp
                                                                             
 $(odir)doprint_flt_t.obj : doprint_flt_all.c doprint.h
-  CC $(CFLAG) doprint_flt_all.c -
+  CC $(CFLAGS) doprint_flt_all.c -
 	/object=$(MMS$TARGET_NAME)/float=IEEE/l_double_size=64/list/show=exp
                                                                             
 

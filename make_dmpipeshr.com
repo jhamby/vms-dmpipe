@@ -1,7 +1,7 @@
 $!
 $! Command procedure to link dmpipeshr.exe shareable image via embedded
 $! linker options file.
-$ link/share=dmpipe_exe:dmpipeshr.exe sys$input/option
+$ link/DEBUG/MAP=dmpipeshr.MAP/DSF=dmpipeshr.DSF/share=dmpipe_exe:dmpipeshr.exe sys$input/option
 $ deck
 !
 ! Linker options file for creating dmpipe shareable image.  This image
@@ -14,6 +14,7 @@ GSMATCH=LEQUAL,1,0
 !
 ! Object files implementing dmpipe wrapper functions.
 !
+dmpipe_lib:dmpipe_libinit.obj
 dmpipe_lib:dmpipe-private_doprint.obj
 dmpipe_bypass.obj
 memstream.obj
@@ -152,7 +153,17 @@ SYMBOL_VECTOR=(-
    dm_perror/DM_PERROR=PROCEDURE,-
    dm_fflush/DM_FFLUSH=PROCEDURE,-
    dm_fsync/DM_FSYNC=PROCEDURE,-
-   dm_isapipe/DM_ISAPIPE=PROCEDURE)
+   dm_isapipe/DM_ISAPIPE=PROCEDURE,-
+   DM_FPUTS=PROCEDURE,-
+   dm_fputs/DM_FPUTS=PROCEDURE,-
+   DMPIPE_RESET_TRACE_FILE=PROCEDURE,-
+   dmpipe_reset_trace_file/DMPIPE_RESET_TRACE_FILE=PROCEDURE,-
+   DM_PUTS=PROCEDURE,-
+   DM_FPUTC=PROCEDURE,-
+   dm_puts/DM_PUTS=PROCEDURE,-
+   dm_fputc/DM_FPUTC=PROCEDURE,-
+   DM_FEOF=PROCEDURE,-
+   dm_feof/DM_FEOF=PROCEDURE)
 
 CASE_SENSITIVE=NO
 

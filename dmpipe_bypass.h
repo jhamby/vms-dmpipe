@@ -32,6 +32,7 @@ int dm_bypass_negotiate (int initial_flags, dm_bypass bp, char *op, int bytes);
 int dm_bypass_read(dm_bypass bp, void *buffer, size_t nbytes, 
 	size_t min_bytes, int *expedite_flag );
 int dm_bypass_write ( dm_bypass bp, const void *buffer, size_t nbytes );
+int is_dm_bypass_peer_done(dm_bypass bp);
 /*
  * dm_bypass_stderr_propagate() is called by parent to convey its stderr
  * to any children whose stdout will be a pipe.  Child calls

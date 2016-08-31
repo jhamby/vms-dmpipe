@@ -16,7 +16,7 @@
 #include <unixio.h>		/* isapipe() */
 #include <fcntl.h>		/* open() */
 #include <poll.h>		/* poll() and friends */
-#include <socket.h>		/* select() was implemented by TCP/IP dev. */
+/*#include <socket.h>*/		/* select() was implemented by TCP/IP dev. */
 #include <time.h>		/* Select() */
 
 int dm_pipe ( int fds[2] );
@@ -33,8 +33,12 @@ FILE *dm_fopen ( const char *file_spec, const char *a_mode, ... );
 size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr );
 size_t dm_fwrite ( const void *ptr, size_t itmsize, size_t nitems, FILE *fptr );
 char *dm_fgets ( char *str, int maxchar, FILE *fptr );
+int dm_fputs(const char *str, FILE *fptr);
+int dm_puts ( const char *str );
 int dm_pclose ( FILE *stream );
 int dm_fgetc ( FILE *fptr );
+int dm_fputc ( int ichar, FILE *fptr );
+int dm_feof ( FILE *fptr );
 int dm_ungetc ( int c, FILE *fptr );
 int dm_fgettok ( FILE *fptr, char *buffer, int bufsize,
     int type, const char cset, int *term_state );
@@ -132,28 +136,45 @@ int dm_scanf_t ( const char *fmt, ... );
 # endif
 #endif
 
-#define pipe dm_pipe
-#define read dm_read
-#define write dm_write
-#define close dm_close
+#define dup(a) dm_dup(a)
+#define dup2(a,b) dm_dup2(a,b)
+#define pipe(a) dm_pipe(a)
+#define read(a,b,c) dm_read(a,b,c)
+#define write(a,b,c) dm_write(a,b,c)
+#define close(a) dm_close(a)
 #define open dm_open
 
-#define perror dm_perror
-#define popen dm_popen
-#define pclose dm_pclose
+#define perror(a) dm_perror(a)
+#define popen(a,b) dm_popen(a,b)
+#define pclose(a) dm_pclose(a)
 #define fopen dm_fopen
-#define fclose dm_fclose
-#define fdopen dm_fdopen
-#define fread dm_fread
-#define fwrite dm_fwrite
-#define fgets dm_fgets
-#define fgetc dm_fgetc
-#define ungetc dm_ungetc
+#define fclose(a) dm_fclose(a)
+#define fdopen(a,b) dm_fdopen(a,b)
+#define fread(a,b,c,d) dm_fread(a,b,c,d)
+#define fwrite(a,b,c,d) dm_fwrite(a,b,c,d)
+#define fgets(a,b,c) dm_fgets(a,b,c)
+#define fputs(a,b) dm_fputs(a,b)
+#define fgetc(a) dm_fgetc(a)
+#define fputc(a,b) dm_fputc(a,b)
+#pragma message save
+#pragma message disable (MACROREDEF)
+#undef feof
+#undef feof_unlocked
+#define feof(a) dm_feof(a)
+#define __feof_(a) dm_feof(a)
+#define feof_unlocked(a) dm_feof(a)
+#pragma message restore
+#define getc(a) dm_fgetc(a)
+#define getchar(a) dm_fgetc(stdin)
+#define putc(a,b) dm_fputc(a,b)
+#define putchar(a) dm_fputc(a, stdout)
+#define puts(a) dm_puts(a)
+#define ungetc(a,b) dm_ungetc(a,b)
 #define fcntl dm_fcntl
-#define poll dm_poll
-#define select dm_select
-#define fflush dm_fflush
-#define fsync dm_fsync
+#define poll(a,b,c) dm_poll(a,b,c)
+#define select(a,b,c,d,e) dm_select(a,b,c,d,e)
+#define fflush(a) dm_fflush(a)
+#define fsync(a) dm_fsync(a)
 #define isapipe(fd) dm_isapipe((fd),0)
 #endif /* DM_NO_CRTL_WRAP */
 

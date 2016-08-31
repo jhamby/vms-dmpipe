@@ -60,6 +60,7 @@
 #include <devdef.h>		/* device characteristics */
 #include <dcdef.h>		/* VMS device class numbers */
 #include <secdef.h>		/* VMS global sections. */
+#include <stsdef.h>		/* VMS condition value/status definitions */
 #include <vadef.h>		/* VMS virtual address space definitions */
 #include <agndef.h>
 #include <cmbdef.h>
@@ -194,6 +195,11 @@ struct dm_bypass_ctx {
     int used;
     char buffer[DM_BYPASS_BUFSIZE];	/* buffer for stdio operations */
 };
+
+/* TRACE */
+extern char dmpipe_trace;
+void dmpipe_trace_output(const char *cp_format, ...);
+/* END TRACE */
 /*
  * Allocate and free stream data handles.
  */
@@ -478,8 +484,9 @@ static int alternate_read_bypass_init ( struct dm_nexus *nexus )
     /*
      * Set implied_lf flag according to POPEN_NO_CRLF_REC_ATTR feature.
      */
-    nexus->alt.implied_lf = 1;
-    status = decc$feature_get ( "DECC$POPEN_NO_CRLF_REC_ATTR", 
+    nexus->alt.implied_lf = 0;
+/*    status = decc$feature_get ( "DECC$POPEN_NO_CRLF_REC_ATTR", */
+    status = decc$feature_get ( "DECC$STREAM_PIPE", 
 	__FEATURE_MODE_CURVAL );
     if ( status == 1 ) nexus->alt.implied_lf = 0;
     else if ( status < 0 ) perror ( "feature get in alt_bypass_init" );
@@ -490,7 +497,7 @@ static int alternate_read_bypass_init ( struct dm_nexus *nexus )
 static int alternate_bypass_read ( struct dm_nexus *nexus, void *buf_vp,
 	size_t nbytes, size_t min_bytes, int *expedite_flag )
 {
-    int count, status, seg, read_modifiers;
+    int count, status, seg, read_modifiers, mbx_eof_pid=0;
     char *buffer;
     /*
      * Move bytes from alt.buffer until min_bytes moved or an exception
@@ -506,38 +513,78 @@ static int alternate_bypass_read ( struct dm_nexus *nexus, void *buf_vp,
 	     * Refill buffer, read from mailbox checking for no writers after
 	     * first read completes.
 	     */
-	    read_modifiers = nexus->alt.iosb.status ? IO$M_WRITERCHECK : 0;
-	    read_modifiers = IO$M_WRITERCHECK;
-	    status = SYS$QIOW ( EFN$C_ENF, nexus->alt.chan,
-		IO$_READVBLK | read_modifiers, &nexus->alt.iosb, 0, 0,
-		nexus->alt.buffer, nexus->alt.buf_size-2, 0, 0, 0, 0 );
-	    if ( (status&1) == 1 ) status = nexus->alt.iosb.status;
-	    /*
-	     * Reset rpos and length according to status of read.
-	     */
-	    nexus->alt.rpos = 0;
-	    if ( status&1 ) {
-		/*
-		 * Success, set length and append lf to end of buffer
-		 */
-		nexus->alt.length = nexus->alt.iosb.count;
-		if ( nexus->alt.implied_lf ) {
+	    if ((nexus->alt.iosb.status == 0) || (nexus->alt.iosb.status != SS$_ENDOFFILE)) {
+                status = SYS$QIOW ( EFN$C_ENF, nexus->alt.chan,
+		                  IO$_SENSEMODE | IO$M_WRITERCHECK , &nexus->alt.iosb, 0, 0,
+		                  0, 0, 0, 0, 0, 0 );
+                if ($VMS_STATUS_SUCCESS(status) && $VMS_STATUS_SUCCESS(nexus->alt.iosb.status))
+                   {
+                   read_modifiers = nexus->alt.iosb.status ? IO$M_WRITERCHECK : 0;
+	          read_modifiers = IO$M_WRITERCHECK;
+	          if (!nexus->alt.implied_lf) read_modifiers |= IO$M_STREAM;
+                   do
+                      {
+                      if (nexus->alt.iosb.status == SS$_ENDOFFILE) mbx_eof_pid = nexus->alt.iosb.pid;
+	             status = SYS$QIOW ( EFN$C_ENF, nexus->alt.chan,
+		                        IO$_READVBLK | read_modifiers, &nexus->alt.iosb, 0, 0,
+		                        nexus->alt.buffer, nexus->alt.buf_size-2, 0, 0, 0, 0 );
+		                        
+		    } while ($VMS_STATUS_SUCCESS(status) && (nexus->alt.iosb.status == SS$_ENDOFFILE) &&
+		             nexus->alt.iosb.pid != mbx_eof_pid);
+		 }
+/* TRACE */
+if (!$VMS_STATUS_SUCCESS(status))
+   {
+/*   dmpipe_trace = 1; */
+   dmpipe_trace_output("SYSQIOW in alternate read bypass returned: %d(0x%X)\r\n", status, status);
+   }
+else
+   if (!$VMS_STATUS_SUCCESS(nexus->alt.iosb.status))
+      {
+/*      dmpipe_trace = 1; */
+      dmpipe_trace_output("SYSQIO request in alternate_read_bypass completed with: %d(0x%X)\r\n",
+                          nexus->alt.iosb.status, nexus->alt.iosb.status);
+      }
+/* END TRACE */
+	       if ( (status&1) == 1 ) status = nexus->alt.iosb.status;
+	       /*
+	        * Reset rpos and length according to status of read.
+	        */
+	       nexus->alt.rpos = 0;
+	       if ( status&1 ) {
+		 /*
+		  * Success, set length and append lf to end of buffer
+		  */
+		 nexus->alt.length = nexus->alt.iosb.count;
+		 if ( nexus->alt.implied_lf ) {
 		    nexus->alt.buffer[nexus->alt.iosb.count] = '\n';
 		    nexus->alt.length++;
-		}
+		 }
 
-	    } else if ( status == SS$_NOWRITER ) {
-		nexus->alt.length = 0;
-		*expedite_flag = 1;	/* force loop exit */
-		if ( count == 0 ) {
+	       } else if ( status == SS$_NOWRITER ) {
+	          nexus->alt.iosb.status = SS$_ENDOFFILE;
+		 nexus->alt.length = 0;
+		 *expedite_flag = 1;	/* force loop exit */
+		 if ( count == 0 ) {
 		    count = -1;
-		    errno = EPIPE;
-		}
-	    } else if ( status == SS$_ENDOFFILE ) {
-		/* Eat the EOF, but complete read short of min_bytes */
-		nexus->alt.length = 0;
+		 }
+	       } else if ( status == SS$_ENDOFFILE ) {
+		 /* Eat the EOF, but complete read short of min_bytes */
+		 nexus->alt.length = 0;
+		 *expedite_flag = 1;
+	       }
+	     } else {
+	         nexus->alt.length = 0;
 		*expedite_flag = 1;
-	    }
+		if ( nexus->alt.rpos != -1) {
+		   nexus->alt.rpos = -1;
+		   count = -1;
+		}
+	      else {
+	           count = -1;
+		  errno = EPIPE;
+	         }
+	     }	       
 
 	    seg = nexus->alt.length;
 	}
@@ -809,7 +856,20 @@ dm_bypass dm_bypass_init ( int fd, int *flags )
      * can attach metadata to (via ACL).
      */
     *flags = 0;
+    device_name[0] = '\0';
     status = get_device_chan_and_info (fd, device_name, &chan, &info, 0 );
+
+/* TRACE */
+    if (!dmpipe_trace)
+       {
+/*       dmpipe_trace = 1; */
+       dmpipe_trace_output("fd %d device name = \"%s\"\r\n", fd, device_name);
+       dmpipe_trace = 0;
+       }
+    else
+       dmpipe_trace_output("fd %d device name = \"%s\"\r\n", fd, device_name);
+
+/* END TRACE */
     if ( (status&1) == 0 ) return 0;		/* error */
 
     if ( ((status&1) == 0) || (info.devclass != DC$_MAILBOX) ) {
@@ -1297,10 +1357,28 @@ int dm_bypass_startup_stall ( int initial_flags, dm_bypass bp, char *op,
      * Bail out if we've stopped negotiating and cleared bit 0 in flags.
      */
     flags = initial_flags & 255;
-    if ( (flags & 1) == 0 ) return flags;	/* negotiation over */
+/* TRACE */
+if (flags)
+{
+/* dmpipe_trace = 1; */
+dmpipe_trace_output("dm_bypass_startup_stall:\r\ninitial_flags=%d(0x%X)\r\n"
+                    "flags = %d(0x%X)\r\n", initial_flags, initial_flags,
+                    flags, flags);
+}
+/* END TRACE */
+    if ( (flags & 1) == 0 )
+    {
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
+     return flags;
+    }	/* negotiation over */
     if ( (flags & 2) && (*op == 'r') ) return flags;
     if ( (flags & 4) && (*op == 'w') ) return flags;
     if ( bp->is_dcl_out ) {
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
 	return 0;			/* stdout being read by DCL */
     }
     /*
@@ -1310,16 +1388,25 @@ int dm_bypass_startup_stall ( int initial_flags, dm_bypass bp, char *op,
     my_val = nexus->lock.my_val;
     peer_val = nexus->lock.peer_val;
     if ( my_val->flags.bit.shutdown || peer_val->flags.bit.shutdown ) {
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
 	return 0;
     }
 
     if ( (*op == 'w') && (nexus->wstream) ) {
 	flags |= 4;
 	if ( flags == 7 ) flags = 6;
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
 	return flags;
     } else if ( nexus->rstream ) {
 	flags |= 2;
 	if ( flags == 7 ) flags = 6;
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
 	return flags;
     }
     /*
@@ -1342,6 +1429,10 @@ if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 	if ( (status&1) == 0 ) {
 	    /* $ENQ failed, stall loop below will exit immediately */
 
+/* TRACE */
+dmpipe_trace_output("Unexpected status from sys_enq to get PW SHM lock:status=%d(0x%X)\r\n",
+                    status, status);
+/* END TRACE */
 	} else if ( peer_val->pid ) {
 	   /*
 	    * Presence of peer in value block means we can negotiate.
@@ -1350,6 +1441,10 @@ if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 	   nexus->mbx_watch.is_blocking_lock = 1;
 	   deassign_nexus_chan ( nexus );
 
+/* TRACE */
+dmpipe_trace_output("Peer process ID is present: assuming SHM bypass.\r\n",
+                    status, status);
+/* END TRACE */
 	} else if ( nexus->dtype == DT$_MBX ) {
 	   /*
 	    * No peer seen in lock value block, set attention AST on mailbox.
@@ -1360,6 +1455,10 @@ if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 	    status = SYS$QIOW ( EFN$C_ENF, nexus->chan, nexus->mbx_watch.func,
 		&nexus->mbx_watch.iosb, 0, 0, stall_mbx_ast, bp, 0, 0, 0, 0 );
  	    if ( (status&1) == 1 ) status = nexus->mbx_watch.iosb.status;
+/* TRACE */
+dmpipe_trace_output("Attempted QIOW to set MBX attention AST:status=%d(0x%X)\r\n",
+                    status, status);
+/* END TRACE */
 	} else if ( nexus->dtype == DT$_PIPE ) {
 	    /*
 	     * DCL pipe driver doesn't have attention ASTs, just stall
@@ -1368,6 +1467,10 @@ if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 	    long long delay;
 	    delay =  200 * -10000;	/* 100-nanosecond ticks */
 	    status = SYS$SETIMR ( EFN$C_ENF, &delay, stall_mbx_ast, bp, 0 );
+/* TRACE */
+dmpipe_trace_output("Attempted SYS$SETIMR for PIPE:status=%d(0x%X)\r\n",
+                    status, status);
+/* END TRACE */
 	}
 	/*
 	 * Stall loop.
@@ -1379,6 +1482,12 @@ if ( !tty ) tty = fopen ( tt_logical, "a", "shr=put" );
 	    SYS$SETAST ( 1 );
 	    if ( status ) {
 	        SYS$HIBER();
+/* TRACE */
+dmpipe_trace_output("Wakeup from SYS$HIBER with:status = %d(0x%X)\r\n"
+                    "is_blocking_lock = %d\r\nmailbox_active = %d\r\n",
+                    status, status, nexus->mbx_watch.is_blocking_lock,
+                    nexus->mbx_watch.mailbox_active);
+/* END TRACE */
 	    }
 	}
 #ifdef DEBUG
@@ -1391,17 +1500,37 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 	 * Wait done, cleanup.  Kill pending attention/timer AST.
 	 */
 	if ( !nexus->mbx_watch.mailbox_active ) {
+/* TRACE */
+dmpipe_trace_output("nexus->mbx_watch.mailbox_active = %d\r\n"
+                    "nexus->dtype = %d\r\n", nexus->mbx_watch.mailbox_active, nexus->dtype);
+/* END TRACE */
 	    if ( nexus->dtype == DT$_MBX ) {
 	      status = SYS$QIOW ( EFN$C_ENF, nexus->chan, nexus->mbx_watch.func,
 	      		&nexus->mbx_watch.iosb, 0, 0, 0, 0, 0, 0, 0, 0 );
+/* TRACE */
+dmpipe_trace_output("QIOW to remove MBX attention AST:status=%d(0x%X)\r\n"
+                    "iosb.status=%d(0x%X)\r\n", status, status,
+                    nexus->mbx_watch.iosb, nexus->mbx_watch.iosb);
+/* END TRACE */
 	    } else {
 		status = SYS$CANTIM ( bp, 0 );
+/* TRACE */
+dmpipe_trace_output("SYS$CANTIM to remove PIPE timer:status=%d(0x%X)\r\n",
+                    status, status);
+/* END TRACE */
 	    }
 	} else if ( (nexus->dtype == DT$_MBX) && (*op == 'r') ) {
 	    /*
 	     * Assign a readonly channel to the mailbox and set new
 	     * attention AST to notify us when no writers
 	     */
+		status = alternate_read_bypass_init ( nexus );
+	     if ( status&1 ) 
+	       flags |= DM_BYPASS_HINT_READS;
+/* TRACE */
+dmpipe_trace_output("Attempted alternate_read_bypass_init:status=%d(0x%X)\r\n"
+                    "flags = %d(0x%X)\r\n", status, status, flags, flags);
+/* END TRACE */
 	}
 
 	if ( nexus->mbx_watch.is_blocking_lock ) {
@@ -1409,6 +1538,10 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 	     * Another process has lock.  setup streams if we can.
 	     */
 	    flags = negotiate_bypass ( flags, bp, op, fcntl_flags );
+/* TRACE */
+dmpipe_trace_output("Attempted negotiate_bypass:flags=%d(0x%X)\r\n",
+                    flags, flags);
+/* END TRACE */
 	    deassign_nexus_chan ( nexus );
 	} else {
 	    /*
@@ -1418,6 +1551,10 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 	    status = sys_enq ( LCK$K_CRMODE, &bp->nexus->lock, LCK$M_NOQUEUE,
 		0, 0 );
 	    flags = (flags&0x7ffe);
+/* TRACE */
+dmpipe_trace_output("No SHM locks detected :status = %d(0x%X)\r\nflags=%d(0x%X)\r\n",
+                    status, status, flags, flags);
+/* END TRACE */
 	    /*
 	     * Check for alternate bypass mode in which we take over
 	     * reads of mailbox to detect no-writers condition.
@@ -1426,6 +1563,10 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 		status = alternate_read_bypass_init ( nexus );
 		if ( status&1 ) 
 		   flags |= (DM_BYPASS_HINT_READS|DM_BYPASS_HINT_POPEN_R);
+/* TRACE */
+dmpipe_trace_output("Attempted alternate_read_bypass_init2:status = %d(0x%X)\r\n"
+                    "flags=%d(0x%X)\r\n", status, status, flags, flags);
+/* END TRACE */
 	    }
 	    deassign_nexus_chan ( nexus );
 	}
@@ -1436,11 +1577,21 @@ fprintf ( tty,"/bypass/ %x-fd[%d] wait complete(sts=%d), lock block: %d, mbx att
 	flags = (flags&0x7ffe);
 	    sys$dassgn ( nexus->chan );
 	    nexus->chan = 0;
+/* TRACE */
+dmpipe_trace_output("Unsupported pipe device!:flags=%d(0x%X)\r\n",
+                    flags, flags);
+/* END TRACE */
     }
     if ( (flags&1) == 0 ) {
+/* TRACE */
+dmpipe_trace_output("SHM bypass not used; removing nexus\r\n");
+/* END TRACE */
 	/* Startup done, deassign channel so CRTL closes down */
 	deassign_nexus_chan ( nexus );
     }
+/* TRACE */
+dmpipe_trace = 0;
+/* END TRACE */
     return flags;
 }
 
@@ -1463,6 +1614,9 @@ int dm_bypass_shutdown ( dm_bypass bp )
 int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes, 
 	size_t min_bytes, int *expedite_flag )
 {
+/* TRACE */
+int count;
+/* END TRACE */
     int doesnt_care;
     if ( bp->nexus->rstream ) {
 	return memstream_read ( bp->nexus->rstream, buffer, nbytes, min_bytes,
@@ -1470,8 +1624,16 @@ int dm_bypass_read ( dm_bypass bp, void *buffer, size_t nbytes,
     }
     if ( bp->nexus->alt.buffer ) {
 	/* Read directly from mailbox, but check for no writers */
-	return alternate_bypass_read ( bp->nexus, buffer, nbytes, min_bytes, 
+	count = alternate_bypass_read ( bp->nexus, buffer, nbytes, min_bytes, 
 		expedite_flag ? expedite_flag : &doesnt_care );
+/* TRACE */
+        if (count == 0)
+           {
+/*           dmpipe_trace = 1; */
+           dmpipe_trace_output("alternate_bypass_read returned 0!\r\n");
+           }
+/* END TRACE */
+	return count;
     }
     return -1;
 }
@@ -1491,4 +1653,28 @@ int dm_bypass_current_streams ( dm_bypass bp,
 	return 0;
     }
     return -1;   /* invalid */
+}
+
+/*
+* Check to see if peer closed its stream.
+*/
+int is_dm_bypass_peer_done(dm_bypass bp)
+{
+int ret_val = 0;
+
+if (bp->nexus->alt.buffer)
+   {
+   ret_val = (bp->nexus->alt.iosb.status == SS$_ENDOFFILE);
+   }
+else
+   {
+   if (bp->nexus->wstream)
+      ret_val = is_memstream_peer_done(bp->nexus->wstream, 1);
+   else
+      if (bp->nexus->rstream)
+         ret_val = is_memstream_peer_done(bp->nexus->rstream, 0);
+      else
+         ret_val = 1;
+   }
+return ret_val;
 }

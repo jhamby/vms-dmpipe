@@ -32,6 +32,7 @@
  *					hanging.
  * Revised: 20-APR-2014			Fix bug in dm_fgetc.
  */
+#include <math.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -46,6 +47,13 @@
 #include <signal.h>
 #include <errnodef.h>		/* C$_Exxx errno VMS condition codes */
 #include <lib$routines.h>
+
+/* TRACE */
+#include <stddef.h>
+#include <descrip.h>
+#include <dscdef.h>
+#include <jpidef.h>
+/* END TRACE */
 
 #define DM_NO_CRTL_WRAP		/* Don't override CRTL names (pipe, etc) */
 #include "dmpipe.h"
@@ -110,6 +118,14 @@ static struct {
     FILE *fp;
     struct dm_fd_extension *fdx;
 } dm_fp_map[FP_TO_FD_TLB_SIZE] = { {0,0}, {0,0}, {0,0} };
+
+/* TRACE */
+FILE *fp_trace=NULL;
+char dmpipe_trace=0;
+char CleanupInitialized=0;
+char CleanupDone=0;
+/* END TRACE */
+
 /*
  * Broken pipe check raises signal if write to pipes fail.  DECC uses
  * SIGPIPE for multiple exceptions, raise with gsignal() to provide
@@ -118,6 +134,95 @@ static struct {
 #define BROKEN_PIPE_CHECK(sts,fdesc) \
    if ( ((sts) < 0) && (fdesc<65000) ) /* raise (SIGPIPE); */ \
    gsignal ( SIGPIPE, 1 );
+   
+/* TRACE */
+char *generate_dmpipe_trace_file_name()
+{
+char *cmd_name=NULL;
+$DESCRIPTOR(cmd_name_dsc, cmd_name);
+unsigned short cmd_name_len;
+unsigned long vms_status;
+unsigned long jpi_image_item=JPI$_IMAGNAME;
+char *cp_start;
+char * dmpipe_dbg_filename=NULL;
+
+cmd_name = (char *)malloc(512);
+cmd_name_dsc.dsc$w_length = 511;
+cmd_name_dsc.dsc$b_dtype = DSC$K_DTYPE_T;
+cmd_name_dsc.dsc$b_class =  DSC$K_CLASS_S;
+cmd_name_dsc.dsc$a_pointer = cmd_name;
+vms_status = lib$getjpi(&jpi_image_item, NULL, NULL, NULL, &cmd_name_dsc, &cmd_name_len);
+cmd_name[cmd_name_len] = '\0';
+cp_start = strrchr(cmd_name, ']') + 1;
+*strrchr(cmd_name, '.') = '\0';
+dmpipe_dbg_filename = (char *)malloc(strlen(cp_start) + 18);
+sprintf(dmpipe_dbg_filename, "dmpipe_trace_%s.txt", cp_start);
+return dmpipe_dbg_filename;
+}
+
+FILE *open_dmpipe_trace_file()
+{
+char *fname = generate_dmpipe_trace_file_name();
+FILE *fptr=NULL;
+
+fptr = fopen(fname, "w+");
+free((void *)fname);
+fprintf(fptr, "dmpipe trace file opened using file pointer %p\r\n", fptr);
+fflush(fptr);
+return fptr;
+}
+
+void dmpipe_trace_output(const char *cp_format, ...)
+{
+va_list vargs;
+
+if (dmpipe_trace != 0)
+   {
+   va_start(vargs, cp_format);
+   if (fp_trace == NULL) fp_trace = open_dmpipe_trace_file();
+   vfprintf(fp_trace, cp_format, vargs);
+   fflush(fp_trace);
+   }
+}
+
+void dmpipe_reset_trace_file()
+{
+if (fp_trace != NULL)
+   {
+   fclose(fp_trace);
+   fp_trace = NULL;
+   }
+fp_trace = open_dmpipe_trace_file();
+}
+/* END TRACE */
+
+void CloseAllDMPipeBypasses(void)
+{
+int fdrow;
+int fdcol;
+
+for (fdrow=0; (fdrow < (dm_fd_ext_high_row + 1)); fdrow++)
+   {
+   if (dm_fd_extrow[fdrow] != NULL)
+      {
+      for (fdcol=0; (fdcol < FD_EXTENSION_MAP_COLS); fdcol++)
+         {
+         if ( dm_fd_extrow[fdrow][fdcol].initialized )
+            {
+            /* Rundown bypass */
+	    dm_fd_extrow[fdrow][fdcol].initialized = 0;
+	    if ( dm_fd_extrow[fdrow][fdcol].bypass_flags && dm_fd_extrow[fdrow][fdcol].bp )
+	       {
+	       dm_bypass_shutdown ( dm_fd_extrow[fdrow][fdcol].bp );
+	       dm_fd_extrow[fdrow][fdcol].bp = 0;
+	       }
+            }
+         }
+      }
+   }
+CleanupDone = 1; 
+}
+
 /*************************************************************************/
 /*
  * Main functions for managing extension blocks:
@@ -160,7 +265,9 @@ static void init_extension ( struct dm_fd_extension *fdx, int fd, FILE *fp )
     /*
      * Determine if device used by FP capable of being bypassed.
      */
+     
     fdx->bp = dm_bypass_init ( fd, &fdx->bypass_flags );
+    
 #ifdef DEBUG
 if ( !tty ) tty = fopen ( "DBG$OUTPUT:", "a", "shr=put" );
     fprintf (tty, "/dmpipe/ init extension for file[%d] (%s), fp=%x, flags=%d\n", 
@@ -257,9 +364,10 @@ static struct dm_fd_extension *find_fp_extension ( FILE *fp, int init_if )
     /*
      * Not in cache, lookup by file descriptor, then associate file pointer
      * with this extension.
-     */
+     */     
     fd = fileno ( fp );
     fdx = find_extension ( fd, init_if );
+
     if ( !fdx ) return fdx;
     if ( !fdx->fp ) fdx->fp = fp;
     /*
@@ -275,6 +383,7 @@ static struct dm_fd_extension *find_fp_extension ( FILE *fp, int init_if )
 
     return fdx;
 }
+
 static void broken_pipe ( int fd )
 {
     exit ( EPIPE );
@@ -290,10 +399,12 @@ int dm_pipe ( int fds[2] )
 {
     int status;
     struct dm_fd_extension *fdx;
-
+/* TRACE */
+dmpipe_trace_output("dm_pipe()\r\n");
+/* END TRACE */
     status = pipe ( fds );
     if ( status != 0 ) return status;
-
+    
     fdx = find_extension ( fds[0], 1 );
     fdx = find_extension ( fds[1], 1 );
 
@@ -305,6 +416,9 @@ ssize_t dm_read ( int fd, void *buffer_vp, size_t nbytes )
     int status, expedite_flag;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_read()\r\n");
+/* END TRACE */
     fdx = find_extension ( fd, 1 );
     if ( fdx->bypass_flags ) {
 	if ( fdx->read_ops == 0 ) {
@@ -338,6 +452,9 @@ ssize_t dm_write ( int fd, const void *buffer_vp, size_t nbytes )
     struct dm_fd_extension *fdx;
     fdx = find_extension ( fd, 1 );
 
+/* TRACE */
+dmpipe_trace_output("dm_write()\r\n");
+/* END TRACE */
     if ( fdx->bypass_flags ) {
 	if ( fdx->write_ops == 0 ) {
 	    /* First time writing, stall for writer to give peer a chance
@@ -364,22 +481,63 @@ int dm_close ( int file_desc )
 {
     int status, i;
     struct dm_fd_extension *fdx;
-    fdx = find_extension ( file_desc, 0 );
-    if ( fdx->fp ) {
-	/* Invalidate cache entry */
-	for ( i = 0; i < FP_TO_FD_TLB_SIZE; i++ ) {
-	    if ( fdx->fp == dm_fp_map[i].fp ) dm_fp_map[i].fp = 0;
-	}
-    }
-    if ( fdx && fdx->initialized ) {	/* Rundown bypass */
-	fdx->initialized = 0;
-	if ( fdx->bypass_flags && fdx->bp ) {
+    
+/* TRACE */
+dmpipe_trace_output("dm_close()\r\n");
+/* END TRACE */
+    if (!CleanupDone)
+       {
+       fdx = find_extension ( file_desc, 0 );
+       if ( fdx->fp ) {
+	 /* Invalidate cache entry */
+	 for ( i = 0; i < FP_TO_FD_TLB_SIZE; i++ ) {
+	     if ( fdx->fp == dm_fp_map[i].fp ) dm_fp_map[i].fp = 0;
+	     }
+          }
+       if ( fdx && fdx->initialized ) {	/* Rundown bypass */
+	 fdx->initialized = 0;
+	 if ( fdx->bypass_flags && fdx->bp ) {
 	    dm_bypass_shutdown ( fdx->bp );
 	    fdx->bp = 0;
-	}
-    }
+	    }
+          }
+       }
     
     return close ( file_desc );
+}
+
+ssize_t dm_feof (FILE *fptr)
+{
+    int status;
+    size_t result=0;
+    struct dm_fd_extension *fdx;
+
+/* TRACE */
+dmpipe_trace_output("dm_feof()\r\n");
+/* END TRACE */
+
+    fdx = find_fp_extension ( fptr, 1 );
+    if ( fdx && fdx->initialized ) {
+	if ( fdx->read_ops == 0 ) {
+	    /* First time reading, stall reader to give peer a chance
+	     * to negotiate bypass */
+	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+		fdx->bp, "w", fdx->fcntl_flags );
+	}
+
+	/*
+	 * Switch for bypass if stream established, otherwise fall through
+	 * to regular feof().
+	 */
+	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
+	    result = is_dm_bypass_peer_done( fdx->bp );
+	    
+	    BROKEN_PIPE_CHECK ( result, fdx->fd );
+	    return result;
+	}
+    }
+    result = feof ( fptr );
+    return result;
 }
 
 int dm_open ( const char *file_spec, int flags, ... )
@@ -388,6 +546,9 @@ int dm_open ( const char *file_spec, int flags, ... )
     struct dm_fd_extension *fdx;
     void *arg3_vp;
     va_list ap;
+/* TRACE */
+dmpipe_trace_output("dm_open()\r\n");
+/* END TRACE */
     /*
      * Support standard open arguments and DEC extension.  VMS doesn't
      * map first page of address space, so value < 512 is assumed to be
@@ -428,6 +589,9 @@ int dm_dup ( int file_desc )
     int fd;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_dup()\r\n");
+/* END TRACE */
     fd = dup ( file_desc );
 
     if ( fd < 0 ) return fd;
@@ -443,6 +607,9 @@ int dm_dup2 ( int file_desc1, int file_desc2 )
 {
     int fd;
     struct dm_fd_extension *fdx2;
+/* TRACE */
+dmpipe_trace_output("dm_dup2()\r\n");
+/* END TRACE */
     /*
      * Locate extension for fd that will be closed.
      */
@@ -470,11 +637,16 @@ FILE *dm_fdopen ( int file_desc, const char *a_mode )
     struct dm_fd_extension *fdx;
     FILE *fp;
 
+/* TRACE */
+dmpipe_trace_output("dm_fdopen()\r\n");
+/* END TRACE */
     fp = fdopen ( file_desc, a_mode );
+    
     if ( fp ) {
         fdx = find_extension ( file_desc, 1 );
 	fdx->fp = fp;		/* associate fp with file_desc */
     }
+    
     return fp;
 }
 
@@ -483,6 +655,9 @@ FILE *dm_popen ( const char *command, const char *type )
     int status;
     struct dm_fd_extension *fdx;
     FILE *fp;
+/* TRACE */
+dmpipe_trace_output("dm_popen()\r\n");
+/* END TRACE */
     /*
      * Convey this process's stderr device to the child.
      */
@@ -508,6 +683,9 @@ FILE *dm_fopen ( const char *file_spec, const char *a_mode, ... )
     struct dm_fd_extension *fdx;
     FILE *fp;
     va_list ap;
+/* TRACE */
+dmpipe_trace_output("dm_fopen()\r\n");
+/* END TRACE */
     /*
      * Support standard open arguments and DEC extension.  VMS doesn't
      * map first page of address space, so value < 512 is assumed to be
@@ -545,11 +723,158 @@ FILE *dm_fopen ( const char *file_spec, const char *a_mode, ... )
     }
     return fp;
 }
+
+int dm_fputc(int ichar, FILE *fptr)
+{
+    int status;
+    size_t result;
+    struct dm_fd_extension *fdx;
+    char *dbgbuffer;
+    unsigned long dbgbuflen;
+
+/* TRACE */
+dmpipe_trace_output("dm_fputc()\r\n");
+/* END TRACE */
+    fdx = find_fp_extension ( fptr, 1 );
+    if ( fdx && fdx->initialized ) {
+	if ( fdx->write_ops == 0 ) {
+	    /* First time writing, stall for writer to give peer a chance
+	     * to negotiate bypass */
+	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+		fdx->bp, "w", fdx->fcntl_flags );
+	}
+	fdx->write_ops++;
+	/*
+	 * Switch for bypass if stream established, otherwise fall through
+	 * to regular fputs.
+	 */
+	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
+	    status = dm_bypass_write ( fdx->bp, (void *)&ichar, 1);
+	    
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
+	    
+	    return (((status != -1) ? ichar : EOF));
+	}
+    }
+    result = fputc ( ichar, fptr );
+    if (result < 0)
+       {
+       status = errno;
+       dbgbuflen = (long)log10((float)result) + (long)log10((float)ichar) + (long)log10((float)status) + (long)(log10((float)((unsigned long)fptr))/log10(16.0)) + 4 + 54 ;
+       dbgbuffer = (char *)calloc(1, dbgbuflen + 1);
+       sprintf(dbgbuffer, "\r\ndm_fputc: returned %d, expected %d, errno = %d, fptr = %p\n", result, ichar, status, fptr);
+       write(STDERR_FILENO, dbgbuffer,dbgbuflen);
+       free((void *)dbgbuffer);
+       }
+	    
+    return result;
+}
+
+int dm_puts(const char *str)
+{
+    int status, status2;
+    unsigned long slen=strlen(str);
+    size_t result;
+    struct dm_fd_extension *fdx;
+    char *dbgbuffer;
+    unsigned long dbgbuflen;
+    static const char new_line = '\n';
+
+/* TRACE */
+dmpipe_trace_output("dm_puts()\r\n");
+/* END TRACE */
+    fdx = find_fp_extension ( stdout, 1 );
+    if ( fdx && fdx->initialized ) {
+	if ( fdx->write_ops == 0 ) {
+	    /* First time writing, stall for writer to give peer a chance
+	     * to negotiate bypass */
+	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+		fdx->bp, "w", fdx->fcntl_flags );
+	}
+	fdx->write_ops++;
+	/*
+	 * Switch for bypass if stream established, otherwise fall through
+	 * to regular fputs.
+	 */
+	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
+	    status = dm_bypass_write ( fdx->bp, (void *)str, slen );
+	    if (dm_bypass_write ( fdx->bp, (void *)&new_line, 1 ) == -1) status = -1;
+	    
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
+	    
+	    return ((status != -1) ? status : EOF);
+	}
+    }
+    result = puts ( str );
+    if (result < 0)
+       {
+       status = errno;
+       dbgbuflen = (long)log10((float)result) + (long)log10((float)slen) + (long)log10((float)status) + (long)(log10((float)((unsigned long)stdout))/log10(16.0)) + 4 + 54 ;
+       dbgbuffer = (char *)calloc(1, dbgbuflen + 1);
+       sprintf(dbgbuffer, "\r\ndm_puts: returned %d, expected %d, errno = %d, fptr = %p\n", result, slen, status, stdout);
+       write(STDERR_FILENO, dbgbuffer,dbgbuflen);
+       free((void *)dbgbuffer);
+       }
+	    
+    return result;
+}
+
+
+int dm_fputs(const char *str, FILE *fptr)
+{
+    int status;
+    unsigned long slen=strlen(str);
+    size_t result;
+    struct dm_fd_extension *fdx;
+    char *dbgbuffer;
+    unsigned long dbgbuflen;
+
+/* TRACE */
+dmpipe_trace_output("dm_fputs()\r\n");
+/* END TRACE */
+    fdx = find_fp_extension ( fptr, 1 );
+    if ( fdx && fdx->initialized ) {
+	if ( fdx->write_ops == 0 ) {
+	    /* First time writing, stall for writer to give peer a chance
+	     * to negotiate bypass */
+	    fdx->bypass_flags = dm_bypass_startup_stall (fdx->bypass_flags,
+		fdx->bp, "w", fdx->fcntl_flags );
+	}
+	fdx->write_ops++;
+	/*
+	 * Switch for bypass if stream established, otherwise fall through
+	 * to regular fputs.
+	 */
+	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
+	    status = dm_bypass_write ( fdx->bp, (void *)str, slen );
+	    
+	    BROKEN_PIPE_CHECK ( status, fdx->fd );
+	    
+	    return (status);
+	}
+    }
+    result = fputs ( str, fptr );
+    if (result < 0)
+       {
+       status = errno;
+       dbgbuflen = (long)log10((float)result) + (long)log10((float)slen) + (long)log10((float)status) + (long)(log10((float)((unsigned long)fptr))/log10(16.0)) + 4 + 54 ;
+       dbgbuffer = (char *)calloc(1, dbgbuflen + 1);
+       sprintf(dbgbuffer, "\r\ndm_fputs: returned %d, expected %d, errno = %d, fptr = %p\n", result, slen, status, fptr);
+       write(STDERR_FILENO, dbgbuffer,dbgbuflen);
+       free((void *)dbgbuffer);
+       }
+	    
+    return result;
+}
+
 size_t dm_fread ( void *ptr, size_t itmsize, size_t nitems, FILE *fptr )
 {
     int status;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_fread()\r\n");
+/* END TRACE */
     fdx = find_fp_extension ( fptr, 1 );
     if ( fdx && fdx->initialized ) {
 	if ( fdx->read_ops == 0 ) {
@@ -569,8 +894,20 @@ fdx->fd, fdx->bypass_flags, status);
 	     * Bypass the CRTL and read via share memory pipe (or other means).
 	     */
 	    int count;
+	    
 	    count = dm_bypass_read ( fdx->bp, ptr, itmsize*nitems, itmsize,0 );
-	    if ( count < 0 ) return 0;
+/* TRACE */
+	    if (count == 0)
+	       {
+/*	       dmpipe_trace = 1; */
+	       dmpipe_trace_output("dm_bypass_read returned 0!\r\n");
+	       }
+/* END TRACE */
+	    if ( count < 0 )
+	       {
+/*	       dmpipe_trace = 1; */
+	       return 0;
+	       }
 	    /*
 	     * After first EOF (count==0), check for special POPEN_R case and
 	     * repoen file on null device, deassiging the bidirectional
@@ -582,9 +919,11 @@ fdx->fd, fdx->bypass_flags, status);
 		fdx->fp = freopen ( "_NL:", "r", fptr );
 		fdx->bypass_flags ^= DM_BYPASS_HINT_POPEN_R;
 	    }
+	    
 	    return count /itmsize;
 	}
     }
+
     return fread ( ptr, itmsize, nitems, fptr );
 }
 
@@ -595,7 +934,12 @@ size_t dm_fwrite ( const void *ptr, size_t itmsize, size_t nitems,
     int status;
     size_t result;
     struct dm_fd_extension *fdx;
+    char *dbgbuffer;
+    unsigned long dbgbuflen;
 
+/* TRACE */
+dmpipe_trace_output("dm_fwrite()\r\n");
+/* END TRACE */
     fdx = find_fp_extension ( fptr, 1 );
     if ( fdx && fdx->initialized ) {
 	if ( fdx->write_ops == 0 ) {
@@ -611,11 +955,24 @@ size_t dm_fwrite ( const void *ptr, size_t itmsize, size_t nitems,
 	 */
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_WRITES ) {
 	    status = dm_bypass_write ( fdx->bp, ptr, itmsize*nitems );
+	    
 	    BROKEN_PIPE_CHECK ( status, fdx->fd );
-	    return status;
+	    
+	    return (status/itmsize);
 	}
     }
-    return fwrite ( ptr, itmsize, nitems, fptr );
+    result = fwrite ( ptr, itmsize, nitems, fptr );
+    if (result != nitems)
+       {
+       status = errno;
+       dbgbuflen = (long)log10((float)result) + (long)log10((float)nitems) + (long)log10((float)status) + (long)(log10((float)((unsigned long)fptr))/log10(16.0)) + 4 + 54 ;
+       dbgbuffer = (char *)calloc(1, dbgbuflen + 1);
+       sprintf(dbgbuffer, "\r\ndm_fwrite: returned %d, expected %d, errno = %d, fptr = %p\n", result, nitems, status, fptr);
+       write(STDERR_FILENO, dbgbuffer,dbgbuflen);
+       free((void *)dbgbuffer);
+       }
+	    
+    return result;
 }
 
 static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
@@ -657,6 +1014,7 @@ static int load_inbuf ( struct dm_fd_extension *fdx, int needed )
 	count = dm_bypass_read ( fdx->bp, &inbuf->buffer[inbuf->length],
 		DM_INBUF_BUFSIZE-inbuf->length, (inbuf_min_delay_control==1) ?
 		needed : (DM_INBUF_BUFSIZE-inbuf->length), &expedite_flag );
+
 	if ( count < 0 ) return -1;
 	if ((count == 0) && (fdx->bypass_flags&DM_BYPASS_HINT_POPEN_R)) {
 	    /*
@@ -681,6 +1039,9 @@ char *dm_fgets ( char *str, int maxchar, FILE *fptr )
     int status, count, remaining, segsize, i, found_newline;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_fgets()\r\n");
+/* END TRACE */
     fdx = find_fp_extension ( fptr, 1 );
     if ( fdx && fdx->initialized ) {
 	if ( fdx->read_ops == 0 ) {
@@ -736,6 +1097,9 @@ int dm_ungetc ( int c, FILE *fptr )
     int status, count;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_ungetc()\r\n");
+/* END TRACE */
     fdx = find_fp_extension ( fptr, 1 );
     if ( fdx && fdx->initialized ) {
 	if ( fdx->read_ops == 0 ) {
@@ -750,7 +1114,7 @@ int dm_ungetc ( int c, FILE *fptr )
 	    if ( 0 == load_inbuf ( fdx, 0 ) ) {
 		if ( fdx->inbuf->rpos > 0 ) {
 		    --fdx->inbuf->rpos;
-	            ucp = (unsigned char *) fdx->inbuf->rpos;
+	            ucp = (unsigned char *)&fdx->inbuf->buffer[fdx->inbuf->rpos];
 		    *ucp = c;
 		} else return EOF;
 	    } else return -1;   /* callers set errno? */
@@ -763,7 +1127,11 @@ int dm_fgetc ( FILE *fptr )
 {
     int status, count;
     struct dm_fd_extension *fdx;
+    int ucp;
 
+/* TRACE */
+dmpipe_trace_output("dm_fgetc()\r\n");
+/* END TRACE */
     fdx = find_fp_extension ( fptr, 1 );
     if ( fdx && fdx->initialized ) {
 	if ( fdx->read_ops == 0 ) {
@@ -774,14 +1142,15 @@ int dm_fgetc ( FILE *fptr )
 	}
 	fdx->read_ops++;
 	if ( fdx->bypass_flags & DM_BYPASS_HINT_READS ) {
-	    unsigned char ucp;
+	    
 	    if ( 0 == load_inbuf ( fdx, 1 ) ) {
 	        ucp = (unsigned char) fdx->inbuf->buffer[fdx->inbuf->rpos];
-		fdx->inbuf->rpos++;
+		fdx->inbuf->rpos++;	    
 		return ucp;
 	    } else return -1;   /* callers set errno? */
 	}
     }
+
     return fgetc ( fptr );
 }
 
@@ -790,10 +1159,16 @@ int dm_fclose ( FILE *fptr )
     int status;
     struct dm_fd_extension *fdx;
 
-    fdx = find_fp_extension ( fptr, 0 );
-    if ( fdx && fdx->initialized ) {
-	rundown_extension ( fdx );
-    }
+/* TRACE */
+dmpipe_trace_output("dm_fclose()\r\n");
+/* END TRACE */
+    if (!CleanupDone)
+       {
+       fdx = find_fp_extension ( fptr, 0 );
+       if ( fdx && fdx->initialized ) {
+	 rundown_extension ( fdx );
+          }
+       }
     return fclose ( fptr );
 }
 int dm_pclose ( FILE *fptr )
@@ -801,10 +1176,16 @@ int dm_pclose ( FILE *fptr )
     int status;
     struct dm_fd_extension *fdx;
 
-    fdx = find_fp_extension ( fptr, 0 );
-    if ( fdx && fdx->initialized ) {
-	rundown_extension ( fdx );
-    }
+/* TRACE */
+dmpipe_trace_output("dm_pclose()\r\n");
+/* END TRACE */
+    if (!CleanupDone)
+       {
+       fdx = find_fp_extension ( fptr, 0 );
+       if ( fdx && fdx->initialized ) {
+	 rundown_extension ( fdx );
+          }
+       }
     return pclose ( fptr );
 }
 /*
@@ -817,6 +1198,9 @@ int dm_isapipe ( int fd, int *bypass_status )
     int status;
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_isapipe()\r\n");
+/* END TRACE */
     fdx = find_extension ( fd, 1 );
     if ( fdx && fdx->initialized && fdx->bp ) {
 	/*
@@ -898,11 +1282,11 @@ fprintf (tty, "/dmpipe/ FD[%d] partial(,,%d) startup set bypass_flags: %d\n",
 #endif
 #ifdef DOPRINT_H
 #define GX_DOPRINT doprint_engine, &doprnt_gx_float_formatters
-#define DX_DOPRINT doprint_engine, &doprnt_gx_float_formatters
-#define TX_DOPRINT  doprint_engine, &doprnt_gx_float_formatters
-#define G_DOPRINT  doprint_engine, &doprnt_gx_float_formatters
-#define D_DOPRINT doprint_engine, &doprnt_gx_float_formatters
-#define T_DOPRINT doprint_engine, &doprnt_gx_float_formatters
+#define DX_DOPRINT doprint_engine, &doprnt_dx_float_formatters
+#define TX_DOPRINT  doprint_engine, &doprnt_tx_float_formatters
+#define G_DOPRINT  doprint_engine, &doprnt_g_float_formatters
+#define D_DOPRINT doprint_engine, &doprnt_d_float_formatters
+#define T_DOPRINT doprint_engine, &doprnt_t_float_formatters
 #else
 int decc$$gxdoprint(), decc$$dxdoprint(), decc$$txdoprint();
 int decc$$gdoprint(), decc$$ddoprint(), decc$$tdoprint();
@@ -927,38 +1311,47 @@ static int vxfprintf ( FILE *fptr, const char *format, va_list ap,
 {
     struct dm_fd_extension *fdx;
     int status, status2, bytes_left;
-    char buffer[400];
+    char *buffer=(char *)malloc(16385);
+/* TRACE */
+dmpipe_trace_output("vxfprintf()\r\n");
+/* END TRACE */
     /*
      * See if file pointer has extended attributes.
      */
     fdx = find_fp_extension ( fptr, 1 );
-    if ( fdx && fdx->initialized && 
-	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
-	/*
-	 * Give engine special output routine than can handle bypass.
-         */
-	status = doprint_engine ( buffer, format, ap, sizeof(buffer),
-		fdx, unistd_partial_cb, &bytes_left FLT_VEC_ARG );
+    if (buffer != NULL) {
+      if ( fdx && fdx->initialized && 
+	  (fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
+	  /*
+	   * Give engine special output routine than can handle bypass.
+           */
+	  status = doprint_engine ( buffer, format, ap, 16385,
+		  fdx, unistd_partial_cb, &bytes_left FLT_VEC_ARG );
 
-        if ( (status >= 0) && bytes_left > 0 ) {
-	    /* Flush buffer */
-	    status2 = unistd_partial_cb ( fdx, buffer, bytes_left );
-	    if ( status2 > 0 ) status += status2;
-	    else if ( status2 < 0 ) status = status2;  /* error */
-	}
-	BROKEN_PIPE_CHECK ( status, fdx->fd );
+          if ( (status >= 0) && bytes_left > 0 ) {
+	      /* Flush buffer */
+	      status2 = unistd_partial_cb ( fdx, buffer, bytes_left );
+	      if ( status2 > 0 ) status += status2;
+	      else if ( status2 < 0 ) status = status2;  /* error */
+	  }
+	  BROKEN_PIPE_CHECK ( status, fdx->fd );
+      } else {
+	  /*
+	   * Not bypassing, use routine that goes directly to CRTL.
+           */
+	  status = doprint_engine ( buffer, format, ap, 16385,
+		  fdx, unistd_partial_cb, &bytes_left FLT_VEC_ARG );
+
+          if ( (status >= 0) && bytes_left > 0 ) {
+	      /* Flush buffer */
+	      status2 = unistd_partial_cb ( fdx, buffer, bytes_left );
+	      if ( status2 > 0 ) status += status2;
+	  }
+      }
+    free(buffer);
     } else {
-	/*
-	 * Not bypassing, use routine that goes directly to CRTL.
-         */
-	status = doprint_engine ( buffer, format, ap, sizeof(buffer),
-		fdx, unistd_partial_cb, &bytes_left FLT_VEC_ARG );
-
-        if ( (status >= 0) && bytes_left > 0 ) {
-	    /* Flush buffer */
-	    status2 = unistd_partial_cb ( fdx, buffer, bytes_left );
-	    if ( status2 > 0 ) status += status2;
-	}
+      status = -1;
+      errno = ENOMEM;
     }
     return status;
 }
@@ -1017,6 +1410,9 @@ int dm_fprintf_tx ( FILE *fptr, const char *format_spec, ... )
     int status;
     va_list ap;
 
+/* TRACE */
+dmpipe_trace_output("dm_fprintf_tx()\r\n");
+/* END TRACE */
     va_start(ap,format_spec);
     status = vxfprintf ( fptr, format_spec, ap, TX_DOPRINT );
     va_end(ap);
@@ -1027,6 +1423,9 @@ int dm_printf_tx ( const char *format_spec, ... )
     int status;
     va_list ap;
 
+/* TRACE */
+dmpipe_trace_output("dm_printf_tx()\r\n");
+/* END TRACE */
     va_start(ap,format_spec);
     status = vxfprintf ( stdout, format_spec, ap, TX_DOPRINT );
     va_end(ap);
@@ -1129,6 +1528,9 @@ int dm_fcntl ( int fd, int cmd, ... )
     struct dm_fd_extension *fdx;
     int i_arg, prev_flags, status, old_rattr, old_wattr, new_attr;
     struct flock *lk_arg; 
+/* TRACE */
+dmpipe_trace_output("dm_fcntl()\r\n");
+/* END TRACE */
     /*
      * Check bypass status.
      */
@@ -1226,6 +1628,9 @@ int dm_poll ( struct pollfd filedes[], nfds_t nfds, int timeout )
     int i, status;
     struct dm_poll_group group;
     struct dm_fd_extension *fdx;
+/* TRACE */
+dmpipe_trace_output("dm_poll()\r\n");
+/* END TRACE */
     /*
      * Setup, create group and add every FD in filedes list to it.
      */
@@ -1298,6 +1703,9 @@ int dm_select ( int nfds, fd_set *readfds, fd_set *writefds,
     int timeout_ms, fd, summary_mask, status, count;
     struct dm_poll_extension *member;
     struct dm_poll_group group;
+/* TRACE */
+dmpipe_trace_output("dm_select()\r\n");
+/* END TRACE */
     /*
      * Convert timeout to millseconds.
      */
@@ -1585,6 +1993,9 @@ int dm_fscanf_tx ( FILE *fptr, const char *format_spec, ... )
     int status, count, remaining, segsize, i, found_newline;
      va_list ap;
 
+/* TRACE */
+dmpipe_trace_output("dm_fscanf_tx()\r\n");
+/* END TRACE */
     va_start ( ap, format_spec );
     status = dm_vfscanf_vec(fptr, format_spec, ap,&doscan_tx_float_formatters);
     va_end ( ap );
@@ -1595,6 +2006,9 @@ int dm_scanf_tx ( const char *format_spec, ... )
     int status, count, remaining, segsize, i, found_newline;
      va_list ap;
 
+/* TRACE */
+dmpipe_trace_output("dm_scanf_tx()\r\n");
+/* END TRACE */
     va_start ( ap, format_spec );
     status = dm_vfscanf_vec(stdin, format_spec, ap,&doscan_tx_float_formatters);
     va_end ( ap );
@@ -1668,6 +2082,9 @@ void dm_perror ( const char *str )
     int status, fd, ecode, vmscode;
     char *errmsg;
     struct dm_fd_extension *fdx;
+/* TRACE */
+dmpipe_trace_output("dm_perror()\r\n");
+/* END TRACE */
     /*
      * Extract error message before we make other calls that could change errno.
      */
@@ -1727,6 +2144,9 @@ int dm_fsync ( int fd )
 {
     struct dm_fd_extension *fdx;
 
+/* TRACE */
+dmpipe_trace_output("dm_fsync()\r\n");
+/* END TRACE */
     fdx = find_extension ( fd, 0 );
     if ( fdx && fdx->initialized &&
 	(fdx->bypass_flags&(DM_BYPASS_HINT_WRITES|DM_BYPASS_HINT_STARTING)) ) {
@@ -1742,6 +2162,9 @@ int dm_fsync ( int fd )
 int dm_fflush ( FILE *fptr )
 {
     struct dm_fd_extension *fdx;
+/* TRACE */
+dmpipe_trace_output("dm_fflush()\r\n");
+/* END TRACE */
     /*
      * Check for flush-all case of fptr null
      */

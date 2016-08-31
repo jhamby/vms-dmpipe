@@ -24,11 +24,18 @@
 #include <jpidef.h>			/* VMS Job/Process Information */
 #include <syidef.h>			/* VMS System Information */
 #include <starlet.h>			/* VMS system services prototypes */
-#include <ssdef.h>			/* VMS system service condition codes*/
+#include <ssdef.h>
+#include <stsdef.h>
+#include <efndef.h>			/* VMS system service condition codes*/
 #include <lib$routines.h>		/* VMS RTL functions */
 #include <builtins.h>			/* DEC C builtin functions */
 
 #include "memstream.h"
+
+/* TRACE */
+extern char dmpipe_trace;
+void dmpipe_trace_output(const char *cp_format, ...);
+/* END TRACE */
 static FILE *tty;
 /*
  * Glocal parameters for spin lock and exit handler.
@@ -464,6 +471,24 @@ static int close_commbuf ( volatile struct commbuf *buf, int close_state )
     release_lock ( buf );
     return prev_state;
 }
+
+/*
+* Check to see if peer has finished using its side of the stream.
+*/
+int is_commbuf_peer_done(volatile struct commbuf *buf, int is_writer)
+{
+int ret_val = 0;
+
+acquire_lock ( buf );
+if (is_writer)
+   ret_val = (buf->state == MEMSTREAM_STATE_READER_DONE);
+else
+   ret_val = (buf->state == MEMSTREAM_STATE_WRITER_DONE);
+release_lock ( buf );
+
+return ret_val;
+}
+
 /***************************************************************************/
 /*
  * Process block/unblock primitives, this implementation use $HIBER/$WAKE.
@@ -802,7 +827,6 @@ int memstream_read ( memstream stream, void *buffer_vp, int bufsize,
 	    if ( report.flags.bit.expedite ) {
 		/* writer is performing a flush */
 		*expedite_flag = 1;
-		break;
 	    }
 	    if ( stream->attributes&MEMSTREAM_ATTR_NONBLOCK ) {
 		/* Return bytes read or EWOULDBLOCK error */
@@ -823,6 +847,15 @@ int memstream_read ( memstream stream, void *buffer_vp, int bufsize,
 	}
     } while ( count < min_bytes );
 
+/* TRACE */
+    if (count == 0)
+       {
+/*       dmpipe_trace = 1; */
+       dmpipe_trace_output("memstream_read returning 0 when:\r\nreturned status = %d\r\nreport.enter_state = %d\r\n"
+                           "report.flags = %d\r\nreport.exit_state = %d\r\n report.transferred = %d\r\n",
+                           status, report.enter_state, report.flags.mask, report.exit_state, report.transferred);
+       }
+/* END TRACE */
     return count;
 }
 
@@ -1019,4 +1052,9 @@ if ( !tty ) tty = fopen ( "DBG$OUTPUT", "w" );
     }
     release_lock ( buf );
     return status;
+}
+
+int is_memstream_peer_done(memstream stream, int is_writer)
+{
+return is_commbuf_peer_done(stream->buf, is_writer);
 }

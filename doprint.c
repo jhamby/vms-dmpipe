@@ -129,6 +129,16 @@ static int parse_conversion_descriptor ( const char *cd_start,
 {
     const char *cur_c;
     char c;
+    
+    /*
+     * Init the precision field to an invalid value of -1.
+     * This allows the conversion routines to distinguish
+     * an unspecified (i.e. default) value versus an explicitly
+     * specified value from the conversion specifier in the
+     * format string.
+     */
+    itm->prec = -1;
+
     /*
      * Check for conversion qualifier character immediately
      * preceding conversion specifier character (*cd_end), and if found
@@ -159,7 +169,6 @@ printf ( "   conversion qualifier candidate: '%c'\n", c );
      * Initialize rest of caller's arguments.
      */
     itm->width = 0;			/* output field width */
-    itm->prec = 0;		/* decimal precision */
     /*
      * Identify and mark flag characters.
      */
@@ -268,7 +277,7 @@ printf ( "   expecting %d precision characters\n", cd_end - cur_c );
 	    if ( isdigit ( c ) ) {
 		if ( itm->prec >= 100000000 ) { return -1; } /* too large */
 		/* assume digits code in contiguously in sequence */
-		itm->prec = (itm->prec)*10 + (c - '0');
+		itm->prec = (itm->prec < 0) ? (c - '0') : (itm->prec)*10 + (c - '0');
 	    } else {
 		return -1;	/* unexpected character */
 	    }
@@ -281,94 +290,284 @@ printf ( "   expecting %d precision characters\n", cd_end - cur_c );
  * of string.  Note that adding
  */
 static int i_to_a ( long long val, char a[24], 
-	struct doprnt_conversion_flags flags )
+	           struct doprnt_conversion_item *cnv )
 {
-    long long rem_stack[22];		/* holds remainders */
-    long long *sp;
-    int is_negative, digit, len;
-
+    long long last_val;
+    unsigned char *sp;
+    int is_negative, digit, len=0;
+    unsigned long val_len;
+    unsigned short prec_zeros=0;
+    unsigned short pad_chars=0;
+    char pad_char=' ';
+    char sign_char='\0';
+    unsigned char rem_stack[22];		/* holds remainders */
+    
 #ifdef TESTIT
-printf ( "i_to_a(%lld,0x%x,%x) entered\n", val, *((int *)&flags), a );
-#endif
+printf ( "i_to_a(%lld,0x%x,%x) entered\n", val, *((int *)&cnv->flags), a );
+#endif    
+    /* The zero flag is ignored when a precision is specified. */
+    if ((cnv->prec >= 0) && cnv->flags.zero) cnv->flags.zero = 0;
+    
+    /* Set default precision of 1 if none specified. */
+    if (cnv->prec < 0) cnv->prec = 1;
+    
+    /* If the zero flag was specified, set the pad character value to the */
+    /* '0' character. */
+    if (cnv->flags.zero) pad_char = '0';
+    
     is_negative = (val < 0);
+    val = abs(val);
     sp = rem_stack;
-    *sp = val;
-    do { val = val/10; *(++sp) = val; } while ( val != 0 );
-    len = 0;
-    if ( is_negative ) {
-	a[len++] = '-';
-	while ( sp > rem_stack ) {
-	    digit = (-1)*(sp[-1] - (*sp)*10); sp--;
-	    a[len++] = digit + '0';
-	}
-    } else {
-	if ( flags.plus ) a[len++] = '+';
-	while ( sp > rem_stack ) {
-	    digit = (sp[-1] - (*sp)*10); sp--;
-	    a[len++] = digit + '0';
-	}
-    }
+    do { last_val = val; val = val/10; *(sp++) = last_val - val*10; } while ( val != 0 );
+    val_len =  sp - rem_stack;
+    
+    /* Check for special case of explicit zero precision and a value */
+    /* of zero. In this case the string of the raw value is empty. */
+    if (cnv->prec || val)
+       {
+       if (val_len < cnv->prec)
+          {
+          prec_zeros = cnv->prec - val_len;
+          val_len += prec_zeros;
+          }
+       
+       /* Account for the sign as part of the value string. */
+       if (is_negative || cnv->flags.plus)
+          {
+          val_len++;
+          if ( is_negative )
+             sign_char = '-';
+          else
+             if ( cnv->flags.plus ) sign_char = '+';
+          }
+       }
+    else
+       val_len = 0;
+
+    /* Determine the number of pad character needed to fill the specified */
+    /* field width. */
+    if (val_len < cnv->width) pad_chars = cnv->width - val_len;
+    
+    /* If there are pad characters to be used then place them in the output string. */
+    /* If the pad character is '0' then, if needed, place the sign character before */
+    /* the pad characters. Otherwise, place the sign after the pad characters. */
+
+    if (pad_chars)
+       {
+       if (pad_char == '0')
+          {
+          if (sign_char != '\0') a[len++] = sign_char;
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          }
+       else
+          {
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          if (sign_char != '\0') a[len++] = sign_char;
+          }
+       }
+    else
+       if (sign_char != '\0') a[len++] = sign_char;
+
+    if (val_len)
+       while ( sp > rem_stack ) {
+         digit = sp[-1]; sp--;
+         a[len++] = digit + '0';
+         }
     a[len] = 0;
     return len;
 }
 
 static int u_to_a ( unsigned long long val, char a[24],
-	struct doprnt_conversion_flags flags )
+	struct doprnt_conversion_item *cnv )
 {
-    unsigned long long rem_stack[22];		/* holds remainders */
-    unsigned long long *sp;
-    int digit, len;
+    unsigned long long last_val;
+    unsigned char *sp;
+    int digit, len=0;
+    unsigned long val_len;
+    unsigned short prec_zeros=0;
+    unsigned short pad_chars=0;
+    char pad_char=' ';
+    char sign_char='\0';
+    unsigned char rem_stack[22];		/* holds remainders */
 
+    /* The zero flag is ignored when a precision is specified. */
+    if ((cnv->prec >= 0) && cnv->flags.zero) cnv->flags.zero = 0;
+    
+    /* Set default precision of 1 if none specified. */
+    if (cnv->prec < 0) cnv->prec = 1;
+    
+    /* If the zero flag was specified, set the pad character value to the */
+    /* '0' character. */
+    if (cnv->flags.zero) pad_char = '0';
+    
     sp = rem_stack;
-    *sp = val;
-    do { val = val/10; *(++sp) = val; } while ( val != 0 );
-    len = 0;
+    do { last_val = val; val = val/10; *(sp++) = last_val - val*10; } while ( val != 0 );
+    val_len =  sp - rem_stack;
 
-    while ( sp > rem_stack ) {
-	digit = (sp[-1] + (*sp)*10); sp--;
-	a[len++] = digit + '0';
-    }
+    /* Check for special case of explicit zero precision and a value */
+    /* of zero. In this case the string of the raw value is empty. */
+    if (cnv->prec || val)
+       {
+       if (val_len < cnv->prec)
+          {
+          prec_zeros = cnv->prec - val_len;
+          val_len += prec_zeros;
+          }
+       
+       /* Account for the sign as part of the value string. */
+       if (cnv->flags.plus)
+          {
+          val_len++;
+          sign_char = '+';
+          }
+       }
+    else
+       val_len = 0;
+
+    /* Determine the number of pad character needed to fill the specified */
+    /* field width. */
+    if (val_len < cnv->width) pad_chars = cnv->width - val_len;
+    
+    /* If there are pad characters to be used then place them in the output string. */
+    /* If the pad character is '0' then, if needed, place the sign character before */
+    /* the pad characters. Otherwise, place the sign after the pad characters. */
+
+    if (pad_chars)
+       {
+       if (pad_char == '0')
+          {
+          if (sign_char != '\0') a[len++] = sign_char;
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          }
+       else
+          {
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          if (sign_char != '\0') a[len++] = sign_char;
+          }
+       }
+    else
+       if (sign_char != '\0') a[len++] = sign_char;
+
+    if (val_len)
+       while ( sp > rem_stack ) {
+          digit = sp[-1]; sp--;
+          a[len++] = digit + '0';
+          }
     a[len] = 0;
     return len;
 }
 static int x_to_a ( unsigned long long val, char a[40],
-	struct doprnt_conversion_flags flags )
+	struct doprnt_conversion_item *cnv )
 {
     unsigned long long mask, rem_stack[22];		/* holds remainders */
     unsigned long long *sp;
-    int digit, len, zero_suppress, nib_pos;
+    int digit, len=0, nib_pos;
     static char nibble[16] = { '0', '1', '2', '3', '4', '5', '6', '7',
-	'8', '9', 'a', 'b', 'c', 'd', 'e' };
+	'8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+    unsigned long val_len;
+    unsigned short prec_zeros=0;
+    unsigned short pad_chars=0;
+    char pad_char=' ';
+    char sign_char='\0';
+    unsigned char shift_val;
+    unsigned char nib_val;
 
+    /* The zero flag is ignored when a precision is specified. */
+    if ((cnv->prec >= 0) && cnv->flags.zero) cnv->flags.zero = 0;
+    
+    /* Set default precision of 1 if none specified. */
+    if (cnv->prec < 0) cnv->prec = 1;
+    
+    /* If the zero flag was specified, set the pad character value to the */
+    /* '0' character. */
+    if (cnv->flags.zero) pad_char = '0';
+    
     mask = val & 0xffffffff00000000L;
-    if ( (flags.sizeq == 3) && flags.zero ) nib_pos = 60;
+    if ( (cnv->flags.sizeq == 3) && cnv->flags.zero ) nib_pos = 60;
     else if ( !mask || (mask==0xffffffff00000000L) ) nib_pos = 28;
     else nib_pos = 60;
 
-    len = 0;
-    zero_suppress = flags.zero ? 0 : 1;
-    if ( flags.uppercase ) {
-      while ( nib_pos > 0 ) {
-	a[len] = toupper(nibble[(val >> nib_pos) & 0x0f]);
-	nib_pos = nib_pos - 4;
-	if ( a[len] == '0' ) {
-	    if  ( zero_suppress ) continue;  /* skip leading zeros */
-	} else zero_suppress = 0;
-	len++;
-      }
-    } else {
-      while ( nib_pos > 0 ) {
-	a[len] = nibble[(val >> nib_pos) & 0x0f];
-	nib_pos = nib_pos - 4;
-	if ( a[len] == '0' ) {
-	    if  ( zero_suppress ) continue;  /* skip leading zeros */
-	} else zero_suppress = 0;
-	len++;
-      }
-    }
-    a[len++] = nibble[val & 0x0f];
-    a[len] = 0;
+    /* Determine the number of hex characters that will be required to */
+    /* represent the value. */
+    shift_val = nib_pos + 4;
+    do
+       {
+       shift_val -= 4;
+       nib_val = ((val >> shift_val) & 0xf);
+       } while (nib_val == 0);
+    nib_pos = shift_val;
+    val_len = (shift_val + 4)/4;
 
+    /* Check for special case of explicit zero precision and a value */
+    /* of zero. In this case the string of the raw value is empty. */
+    if (cnv->prec || val)
+       {
+       if (val_len < cnv->prec)
+          {
+          prec_zeros = cnv->prec - val_len;
+          val_len += prec_zeros;
+          }
+       
+       /* Account for the sign as part of the value string. */
+       if (cnv->flags.plus)
+          {
+          val_len++;
+          sign_char = '+';
+          }
+       }
+    else
+       val_len = 0;
+
+    /* Determine the number of pad character needed to fill the specified */
+    /* field width. */
+    if (val_len < cnv->width) pad_chars = cnv->width - val_len;
+    
+    /* If there are pad characters to be used then place them in the output string. */
+    /* If the pad character is '0' then, if needed, place the sign character before */
+    /* the pad characters. Otherwise, place the sign after the pad characters. */
+
+    if (pad_chars)
+       {
+       if (pad_char == '0')
+          {
+          if (sign_char != '\0') a[len++] = sign_char;
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          }
+       else
+          {
+          for (int i=len; ((i - len) < pad_chars); i++) a[i] = pad_char;
+          len += pad_chars;
+          if (sign_char != '\0') a[len++] = sign_char;
+          }
+       }
+    else
+       if (sign_char != '\0') a[len++] = sign_char;
+
+    if (val_len)
+       {
+       if ( cnv->flags.uppercase ) {
+          while ( nib_pos > 0 ) {
+	    a[len] = toupper(nibble[(val >> nib_pos) & 0x0f]);
+	    nib_pos = nib_pos - 4;
+	    len++;
+             }
+          a[len++] = toupper(nibble[val & 0x0f]);
+
+       } else {
+          while ( nib_pos > 0 ) {
+	    a[len] = nibble[(val >> nib_pos) & 0x0f];
+	    nib_pos = nib_pos - 4;
+	    len++;
+             }
+          a[len++] = nibble[val & 0x0f];
+          }
+       }
+    a[len] = 0;
     return len;
 }
 /*
@@ -434,7 +633,29 @@ static int output_item ( struct stream_descriptor *stream,
 	    break;
 	}
 
-	count = i_to_a ( out_val, common_field, cnv->flags );
+	count = i_to_a ( out_val, common_field, cnv );
+	count = put_stream ( stream, common_field, count );
+	if ( count < 0 ) return count;
+
+    } else if ( cnv->specifier_char == 'u' ) {
+	/*
+	 * Unsigned decimal Integer conversion.
+	 */
+	unsigned long long out_val;
+	switch ( cnv->flags.sizeq ) {
+	  case 0:
+	  case 1:
+	    out_val = cnv->value.uint_arg;
+	    break;
+	  case 2:
+	    out_val = cnv->value.ulong_arg;
+	    break;
+	  case 3:
+	    out_val = cnv->value.ulong_long_arg;
+	    break;
+	}
+
+	count = u_to_a ( out_val, common_field, cnv );
 	count = put_stream ( stream, common_field, count );
 	if ( count < 0 ) return count;
 
@@ -456,7 +677,7 @@ static int output_item ( struct stream_descriptor *stream,
     } else if ( (cnv->specifier_char == 'x') || 
 		(cnv->specifier_char == 'X') ) {
 	/*
-	 * Integer conversion.
+	 * Unsigned hexadecimal Integer conversion.
 	 */
 	unsigned long long out_val;
 	switch ( cnv->flags.sizeq ) {
@@ -472,13 +693,14 @@ static int output_item ( struct stream_descriptor *stream,
 	    break;
 	}
 	if ( isupper(cnv->specifier_char) ) cnv->flags.uppercase = 1;
-	count = x_to_a ( out_val, common_field, cnv->flags );
+	count = x_to_a ( out_val, common_field, cnv );
 	count = put_stream ( stream, common_field, count );
 	if ( count < 0 ) return count;
 
     } else if ( strchr ( "fFgGeE", cnv->specifier_char ) ) {
 	fill = 0;
-	if ( cnv->prec == 0 ) cnv->prec = 6;	/* default */
+    /* Set default precision of 6 if none specified. */
+         if (cnv->prec < 0) cnv->prec = 6;
 	if ( (cnv->flags.sizeq == 0) || (cnv->flags.sizeq == 2) ) {
 	    count = flt_vec->fmt_double ( cnv, common_field, 
 		sizeof(common_field) );
@@ -542,7 +764,7 @@ int doprint_engine (
     status = 0;
     for ( fmt_ptr = format_spec; *fmt_ptr; fmt_ptr++ ) {
 	c = *fmt_ptr;
-	if ( c == '%' ) {
+	if (( c == '%' ) && (*(fmt_ptr + 1) != '%')) {
 	    /*
 	     * Find the conversion specifier character that terminates
 	     * the descriptor;
@@ -608,6 +830,8 @@ cnv.flags.sizeq);
 		    case 10:
 			cnv.value.uint_arg = va_arg(ap, unsigned int); break;
 		    case 11:
+			cnv.value.ulong_arg = va_arg(ap, unsigned short); break;
+		    case 12:
 			cnv.value.ulong_arg = va_arg(ap, unsigned long); break;
 		    case 13:
 			break;		/* do nothing */
@@ -637,6 +861,7 @@ cnv.specifier_char, cnv.flags.sizeq, arg_type_map[sc_index].qual[cnv.flags.sizeq
 		return -1;
 	    }
 	} else {
+	    if (c == '%') fmt_ptr++;
 	    stream.buffer[stream.used++] = c;
 	    if ( stream.used >= stream.size ) {
 		if ( flush_stream ( &stream ) < 0 ) break;
@@ -644,6 +869,7 @@ cnv.specifier_char, cnv.flags.sizeq, arg_type_map[sc_index].qual[cnv.flags.sizeq
 	}
     }
     if ( stream.used > 0 ) flush_stream ( &stream );
+    status = stream.used;
     return status;
 }
 /*************************************************************************/
